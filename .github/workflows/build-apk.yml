@@ -8,7 +8,7 @@ on:
         default: "jogo"
       arquivo:
         description: "Nome do arquivo do jogo (.zip ou .rar) dentro da release"
-        default: "27.August.2023.rar"
+        default: "ys_2020_08_31_1200noon.zip"
 
 permissions:
   contents: read
@@ -16,13 +16,17 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
-      ZIP_NAME: projeto_unity.zip
-      APK_NAME: LoveCrush Port.apk
-      APP_ID: com.HonokoDev.LoveCrushAndroid
+      ZIP_NAME: YanLite V1.zip
+      APK_NAME: YanLite Simulator 2020.apk
+      APP_NAME: YanLite Simulator 2020
+      APP_ID: com.HonokoDev.YanLiteSimulator
+      UNITY_THISISABUILDMACHINE: "1"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false"
     steps:
       - name: Verificacao previa (avisa os erros logo no comeco)
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
@@ -89,6 +93,7 @@ jobs:
           echo "Verificacao previa concluida sem problemas."
 
       - name: Instalar Unity Hub 3.22.6 (versao antiga, caminho /opt)
+        timeout-minutes: 20
         run: |
           wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
           sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
@@ -104,6 +109,7 @@ jobs:
           ls -la /opt/unityhub/unityhub
 
       - name: Baixar o jogo da release
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
@@ -151,6 +157,7 @@ jobs:
           ls "$GAME_DIR"
 
       - name: Obter o AssetRipper (da release do jogo ou do site oficial)
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
@@ -180,6 +187,7 @@ jobs:
           ls -la "$(dirname "$BIN")"
 
       - name: Iniciar o AssetRipper (sem janela)
+        timeout-minutes: 5
         run: |
           nohup "$RIPPER_BIN" --headless --port 8080 > ripper.log 2>&1 &
           for i in $(seq 1 60); do
@@ -189,6 +197,7 @@ jobs:
           echo "AssetRipper nao subiu. Log:"; cat ripper.log; exit 1
 
       - name: Carregar e exportar o projeto Unity
+        timeout-minutes: 100
         run: |
           set -e
           mkdir -p work/saida
@@ -212,27 +221,31 @@ jobs:
           echo "Cenas: $(find work/saida -name '*.unity' | wc -l)"
 
       - name: Parar o AssetRipper e liberar espaco
+        timeout-minutes: 5
         if: always()
         run: |
           pkill -f AssetRipper || true
           rm -rf work/jogo ripper
           df -h /
 
-      - name: Compactar o projeto exportado (projeto_unity.zip)
+      - name: Compactar o projeto exportado (YanLite V1.zip)
+        timeout-minutes: 20
         run: |
           cd work
           zip -qr -1 "$GITHUB_WORKSPACE/$ZIP_NAME" saida
           ls -lh "$GITHUB_WORKSPACE/$ZIP_NAME"
 
-      - name: Disponibilizar o projeto_unity.zip para download
+      - name: Disponibilizar o YanLite V1.zip para download
+        timeout-minutes: 20
         uses: actions/upload-artifact@v4
         with:
-          name: projeto_unity
-          path: projeto_unity.zip
+          name: YanLite-V1
+          path: ${{ env.ZIP_NAME }}
           compression-level: 0
           retention-days: 14
 
       - name: Arrumar o projeto para o build
+        timeout-minutes: 10
         run: |
           set -e
           PROJECT="work/saida/ExportedProject"
@@ -251,6 +264,7 @@ jobs:
           df -h /
 
       - name: Criar script de build do Editor
+        timeout-minutes: 5
         run: |
           mkdir -p project/Assets/Editor
           cat > project/Assets/Editor/CIBuild.cs <<'EOF'
@@ -261,10 +275,30 @@ jobs:
 
           public static class CIBuild
           {
+              static void SetQ(SerializedProperty q, string n, float v)
+              {
+                  SerializedProperty p = q.FindPropertyRelative(n);
+                  if (p == null) return;
+                  if (p.propertyType == SerializedPropertyType.Boolean) p.boolValue = v != 0f;
+                  else if (p.propertyType == SerializedPropertyType.Float) p.floatValue = v;
+                  else if (p.propertyType == SerializedPropertyType.Integer || p.propertyType == SerializedPropertyType.Enum) p.intValue = (int)v;
+              }
+
               public static void Build()
               {
                   string appId = System.Environment.GetEnvironmentVariable("APP_ID");
                   string workspace = System.Environment.GetEnvironmentVariable("GITHUB_WORKSPACE");
+                  string appName = System.Environment.GetEnvironmentVariable("APP_NAME");
+                  if (string.IsNullOrEmpty(appName)) appName = "YanLite Simulator 2020";
+                  string apkName = System.Environment.GetEnvironmentVariable("APK_NAME");
+                  if (string.IsNullOrEmpty(apkName)) apkName = "YanLite Simulator 2020.apk";
+
+                  // Log mais curto: sem rastro de pilha em cada mensagem
+                  foreach (LogType lt in System.Enum.GetValues(typeof(LogType))) Application.SetStackTraceLogType(lt, StackTraceLogType.None);
+
+                  // Nome que aparece no celular depois de instalado
+                  PlayerSettings.productName = appName;
+                  PlayerSettings.companyName = "HonokoDev";
 
                   // Cursor padrao invalido derruba o Unity (sinal 11) no fim do build
                   PlayerSettings.defaultCursor = null;
@@ -279,7 +313,10 @@ jobs:
                   PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARMv7 | AndroidArchitecture.ARM64;
                   PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
                   PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new UnityEngine.Rendering.GraphicsDeviceType[] { UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 });
-                  PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.Android, ManagedStrippingLevel.Disabled);
+                  PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.Android, ManagedStrippingLevel.Low);
+                  PlayerSettings.stripEngineCode = true;
+                  PlayerSettings.stripUnusedMeshComponents = true;
+                  PlayerSettings.use32BitDisplayBuffer = false;
                   PlayerSettings.Android.useCustomKeystore = false;
                   PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, Il2CppCompilerConfiguration.Release);
                   PlayerSettings.SetMobileMTRendering(BuildTargetGroup.Android, true);
@@ -312,6 +349,41 @@ jobs:
                   }
                   catch (System.Exception e) { Debug.LogWarning("Qualidade padrao nao ajustada: " + e.Message); }
 
+                  // Deixa TODOS os niveis de qualidade no minimo (o jogo nao tem como "subir" sozinho)
+                  try
+                  {
+                      Object[] qa2 = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/QualitySettings.asset");
+                      if (qa2 != null && qa2.Length > 0)
+                      {
+                          SerializedObject qso2 = new SerializedObject(qa2[0]);
+                          SerializedProperty lv = qso2.FindProperty("m_QualitySettings");
+                          if (lv != null)
+                          {
+                              for (int li = 0; li < lv.arraySize; li++)
+                              {
+                                  SerializedProperty q = lv.GetArrayElementAtIndex(li);
+                                  SetQ(q, "pixelLightCount", 1);
+                                  SetQ(q, "shadows", 0);
+                                  SetQ(q, "shadowCascades", 1);
+                                  SetQ(q, "shadowDistance", 0f);
+                                  SetQ(q, "textureQuality", 1);
+                                  SetQ(q, "anisotropicTextures", 0);
+                                  SetQ(q, "antiAliasing", 0);
+                                  SetQ(q, "softParticles", 0);
+                                  SetQ(q, "softVegetation", 0);
+                                  SetQ(q, "realtimeReflectionProbes", 0);
+                                  SetQ(q, "billboardsFaceCameraPosition", 0);
+                                  SetQ(q, "vSyncCount", 0);
+                                  SetQ(q, "lodBias", 0.6f);
+                                  SetQ(q, "maximumLODLevel", 1);
+                                  SetQ(q, "particleRaycastBudget", 16);
+                              }
+                              qso2.ApplyModifiedPropertiesWithoutUndo();
+                          }
+                      }
+                  }
+                  catch (System.Exception e) { Debug.LogWarning("Niveis de qualidade nao ajustados: " + e.Message); }
+
                   string[] scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
                   if (scenes.Length == 0)
                   {
@@ -326,9 +398,9 @@ jobs:
                   var options = new BuildPlayerOptions
                   {
                       scenes = scenes,
-                      locationPathName = Path.Combine(outDir, "LoveCrush Port.apk"),
+                      locationPathName = Path.Combine(outDir, apkName),
                       target = BuildTarget.Android,
-                      options = BuildOptions.CompressWithLz4
+                      options = BuildOptions.CompressWithLz4HC
                   };
 
                   var report = BuildPipeline.BuildPlayer(options);
@@ -340,7 +412,64 @@ jobs:
           }
           EOF
 
+      - name: Silenciar avisos do compilador C# (menos linhas no log)
+        timeout-minutes: 5
+        run: |
+          # codigo descompilado gera milhares de avisos inofensivos
+          echo "-nowarn:0168,0219,0649,0414,0108,0109,0114,0162,0169,0618,0067,0659,0660,0661,0252,0253,0472,1717,0105,0642" >> project/Assets/csc.rsp
+          cat project/Assets/csc.rsp
+
+      - name: Otimizar importacao de texturas e audio (menos memoria e APK menor)
+        timeout-minutes: 5
+        run: |
+          mkdir -p project/Assets/Editor
+          cat > project/Assets/Editor/MobileImportOptimizer.cs <<'IMPEOF'
+          using UnityEditor;
+          using UnityEngine;
+
+          // Roda durante a importacao do projeto (antes do build), sem reimportar duas vezes.
+          public class MobileImportOptimizer : AssetPostprocessor
+          {
+              const int MaxTextureSize = 1024;
+
+              void OnPreprocessTexture()
+              {
+                  TextureImporter ti = assetImporter as TextureImporter;
+                  if (ti == null) return;
+                  if (ti.textureType == TextureImporterType.Cursor) return;
+                  ti.anisoLevel = 0;
+                  ti.crunchedCompression = false;
+                  TextureImporterPlatformSettings ps = ti.GetPlatformTextureSettings("Android");
+                  ps.overridden = true;
+                  ps.maxTextureSize = Mathf.Min(ps.maxTextureSize, MaxTextureSize);
+                  ps.format = TextureImporterFormat.Automatic;
+                  ps.textureCompression = TextureImporterCompression.Compressed;
+                  ps.compressionQuality = 0;   // rapido: compressao lenta parece travamento no CI
+                  ps.crunchedCompression = false;
+                  ti.SetPlatformTextureSettings(ps);
+              }
+
+              void OnPreprocessAudio()
+              {
+                  AudioImporter ai = assetImporter as AudioImporter;
+                  if (ai == null) return;
+                  long size = 0;
+                  try { size = new System.IO.FileInfo(assetPath).Length; } catch (System.Exception) { }
+                  AudioImporterSampleSettings st = ai.defaultSampleSettings;
+                  st.compressionFormat = AudioCompressionFormat.Vorbis;
+                  st.quality = 0.4f;
+                  st.sampleRateSetting = AudioSampleRateSetting.OptimizeSampleRate;
+                  // musicas longas tocam por streaming; efeitos curtos ficam comprimidos na memoria
+                  st.loadType = size > 1500000 ? AudioClipLoadType.Streaming : AudioClipLoadType.CompressedInMemory;
+                  ai.defaultSampleSettings = st;
+                  ai.SetOverrideSampleSettings("Android", st);
+                  ai.loadInBackground = true;
+              }
+          }
+          IMPEOF
+
       - name: Criar camada de toque (joystick e botoes)
+        timeout-minutes: 5
         run: |
           cat > project/Assets/TouchControls.cs <<'CSEOF'
           using System.Collections;
@@ -359,6 +488,15 @@ jobs:
               static string lastKey = "-";
               static bool shiftOn; // Shift vira liga/desliga: 1 toque corre, outro toque anda
               static int errCount;
+              // teclado virtual: fila de teclas "digitadas" que viram toques de tecla no jogo
+              static readonly Queue<KeyCode> tapQueue = new Queue<KeyCode>();
+              static KeyCode tapKey = KeyCode.None;
+              static int tapUntil;
+              static int anyPressedFrame = -1;
+              static string typedNow = "";
+              static int typedFrame = -1;
+              TouchScreenKeyboard kb;
+              string kbPrev = "";
               static int updatedFrame;
               static readonly Dictionary<KeyCode, int> pressSeen = new Dictionary<KeyCode, int>();
               static readonly Dictionary<KeyCode, int> releaseSeen = new Dictionary<KeyCode, int>();
@@ -375,6 +513,7 @@ jobs:
                   public Rect r;
                   public int finger = -1;
                   public bool wasHeld;
+                  public float fs = 0.27f;
               }
 
               readonly List<Btn> btns = new List<Btn>();
@@ -396,7 +535,19 @@ jobs:
                   instance = go.AddComponent<TouchControls>();
               }
 
-              public static bool IsDown(KeyCode k) { bool v; return down.TryGetValue(k, out v) && v; }
+              public static bool IsDown(KeyCode k) { if (tapKey != KeyCode.None && tapKey == k) return true; bool v; return down.TryGetValue(k, out v) && v; }
+              public static bool AnyDown
+              {
+                  get
+                  {
+                      if (tapKey != KeyCode.None) return true;
+                      foreach (KeyValuePair<KeyCode, bool> kv in down) if (kv.Value) return true;
+                      return false;
+                  }
+              }
+              public static bool AnyPressed { get { return anyPressedFrame == Time.frameCount; } }
+              // Texto digitado no teclado do celular neste quadro ("\b" = apagar, "\n" = enter)
+              public static string Typed { get { return typedFrame == Time.frameCount ? typedNow : ""; } }
               // GetKeyDown/Up virtual. O codigo normal (Update) enxerga o toque no proprio quadro.
               // Ja a fisica (OnTriggerStay, FixedUpdate...) roda ANTES do Update do quadro, entao recebe
               // o toque uma unica vez, no primeiro passo de fisica depois dele.
@@ -423,7 +574,7 @@ jobs:
                   down.TryGetValue(k, out cur);
                   if (on == cur) return;
                   down[k] = on;
-                  if (on) { pressedFrame[k] = Time.frameCount; lastKey = k.ToString(); }
+                  if (on) { pressedFrame[k] = Time.frameCount; lastKey = k.ToString(); anyPressedFrame = Time.frameCount; }
                   else releasedFrame[k] = Time.frameCount;
               }
 
@@ -434,12 +585,90 @@ jobs:
                   lastError = cond.Length > 140 ? cond.Substring(0, 140) : cond;
               }
 
-              void AddBtn(string label, KeyCode key)
+              void AddBtn(string label, KeyCode key) { AddBtn(label, key, 0.27f); }
+
+              void AddBtn(string label, KeyCode key, float fs)
               {
                   Btn b = new Btn();
                   b.label = label;
                   b.key = key;
+                  b.fs = fs;
                   btns.Add(b);
+              }
+
+              // ---- Teclado do celular ----
+              void ToggleKeyboard()
+              {
+                  if (kb != null && kb.active) { kb.active = false; kb = null; return; }
+                  TouchScreenKeyboard.hideInput = true;
+                  kb = TouchScreenKeyboard.Open("", TouchScreenKeyboardType.Default, false, false, false);
+                  kbPrev = "";
+              }
+
+              static KeyCode CharToKey(char c)
+              {
+                  if (c >= 'a' && c <= 'z') return KeyCode.A + (c - 'a');
+                  if (c >= 'A' && c <= 'Z') return KeyCode.A + (c - 'A');
+                  if (c >= '0' && c <= '9') return KeyCode.Alpha0 + (c - '0');
+                  if (c == ' ') return KeyCode.Space;
+                  return KeyCode.None;
+              }
+
+              // Le o que foi digitado e transforma em teclas do jogo (GetKey/GetKeyDown) e em inputString
+              void UpdateKeyboard()
+              {
+                  string added = "";
+                  if (kb != null)
+                  {
+                      string t = kb.text ?? "";
+                      if (t != kbPrev)
+                      {
+                          if (t.StartsWith(kbPrev)) added = t.Substring(kbPrev.Length);
+                          else if (kbPrev.StartsWith(t))
+                          {
+                              for (int i = 0; i < kbPrev.Length - t.Length; i++) { tapQueue.Enqueue(KeyCode.Backspace); added += "\b"; }
+                          }
+                          else added = t;
+                          kbPrev = t;
+                      }
+                      for (int i = 0; i < added.Length; i++)
+                      {
+                          KeyCode k = CharToKey(added[i]);
+                          if (k != KeyCode.None) tapQueue.Enqueue(k);
+                      }
+                      TouchScreenKeyboard.Status st = kb.status;
+                      if (st == TouchScreenKeyboard.Status.Done)
+                      {
+                          tapQueue.Enqueue(KeyCode.Return);
+                          added += "\n";
+                          kb = null;
+                      }
+                      else if (st == TouchScreenKeyboard.Status.Canceled || st == TouchScreenKeyboard.Status.LostFocus)
+                      {
+                          kb = null;
+                      }
+                      else if (kbPrev.Length > 100) { kb.text = ""; kbPrev = ""; }
+                  }
+                  typedNow = added;
+                  typedFrame = Time.frameCount;
+              }
+
+              // Segura cada tecla digitada por 3 quadros, uma de cada vez
+              void ProcessTaps()
+              {
+                  if (tapKey != KeyCode.None && Time.frameCount >= tapUntil)
+                  {
+                      releasedFrame[tapKey] = Time.frameCount;
+                      tapKey = KeyCode.None;
+                  }
+                  else if (tapKey == KeyCode.None && tapQueue.Count > 0)
+                  {
+                      tapKey = tapQueue.Dequeue();
+                      tapUntil = Time.frameCount + 3;
+                      pressedFrame[tapKey] = Time.frameCount;
+                      lastKey = tapKey.ToString();
+                      anyPressedFrame = Time.frameCount;
+                  }
               }
 
               void Awake()
@@ -447,7 +676,7 @@ jobs:
                   circle = MakeCircle(128);
                   Application.logMessageReceived += OnLog;
                   // Linha de cima (canto superior direito): menu + acoes de tecla segurar/apertar
-                  AddBtn("Menu", KeyCode.Escape);      // PauseMenu
+                  AddBtn("Esc", KeyCode.Escape);       // PauseMenu
                   AddBtn("P", KeyCode.P);              // KillSystem21
                   AddBtn("K", KeyCode.K);              // KillSystem3 / KillSystem18
                   AddBtn("H", KeyCode.H);              // KillSystem13
@@ -463,6 +692,15 @@ jobs:
                   AddBtn("Space", KeyCode.Space);      // KillSystem14 / KillSystem15
                   AddBtn("X", KeyCode.X);              // KillSystem24 / KillSystem26
                   AddBtn("Y", KeyCode.Y);              // KillSystem16 / KillSystem23
+                  // Canto superior esquerdo: Ctrl, 1-5, Enter e o botao que abre o teclado do celular
+                  AddBtn("Ctrl", KeyCode.LeftControl, 0.2f);
+                  AddBtn("1", KeyCode.Alpha1, 0.3f);
+                  AddBtn("2", KeyCode.Alpha2, 0.3f);
+                  AddBtn("3", KeyCode.Alpha3, 0.3f);
+                  AddBtn("4", KeyCode.Alpha4, 0.3f);
+                  AddBtn("5", KeyCode.Alpha5, 0.3f);
+                  AddBtn("Enter", KeyCode.Return, 0.17f);
+                  AddBtn("Kbd", KeyCode.None, 0.2f);   // abre/fecha o teclado do celular
                   Layout();
               }
 
@@ -484,7 +722,7 @@ jobs:
                       btns[i].r = new Rect(x, y, s, s);
                   }
                   // grade 4 colunas x 2 linhas no canto inferior direito
-                  for (int i = 6; i < btns.Count; i++)
+                  for (int i = 6; i < 14; i++)
                   {
                       int k = i - 6;
                       int row = k / 4;
@@ -492,6 +730,14 @@ jobs:
                       float x = w - m - unit - (3 - col) * (unit + g);
                       float y = m + (1 - row) * (unit + g);
                       btns[i].r = new Rect(x, y, unit, unit);
+                  }
+                  // 8 botoes menores no canto superior esquerdo
+                  float s2 = unit * 0.62f;
+                  float g2 = unit * 0.08f;
+                  for (int i = 14; i < btns.Count; i++)
+                  {
+                      int k = i - 14;
+                      btns[i].r = new Rect(m + k * (s2 + g2), h - m - s2, s2, s2);
                   }
               }
 
@@ -567,6 +813,12 @@ jobs:
                   {
                       Btn b = btns[i];
                       bool held = b.finger >= 0;
+                      if (b.key == KeyCode.None)
+                      {
+                          if (held && !b.wasHeld) ToggleKeyboard();
+                          b.wasHeld = held;
+                          continue;
+                      }
                       if (b.key == KeyCode.LeftShift)
                       {
                           if (held && !b.wasHeld) shiftOn = !shiftOn;
@@ -575,6 +827,8 @@ jobs:
                       else SetKey(b.key, held);
                       b.wasHeld = held;
                   }
+                  UpdateKeyboard();
+                  ProcessTaps();
                   updatedFrame = Time.frameCount;
               }
 
@@ -599,9 +853,10 @@ jobs:
                   {
                       Btn b = btns[i];
                       Rect gr = new Rect(b.r.x, h - b.r.yMax, b.r.width, b.r.height);
-                      GUI.color = new Color(1f, 1f, 1f, (b.finger >= 0 || (b.key == KeyCode.LeftShift && shiftOn)) ? 0.95f : 0.5f);
+                      GUI.color = new Color(1f, 1f, 1f, (b.finger >= 0 || (b.key == KeyCode.LeftShift && shiftOn) || (b.key == KeyCode.None && kb != null)) ? 0.95f : 0.5f);
                       GUI.DrawTexture(gr, circle);
                       GUI.color = Color.white;
+                      style.fontSize = Mathf.RoundToInt(unit * b.fs);
                       GUI.Label(gr, b.label, style);
                   }
                   GUI.color = Color.white;
@@ -654,6 +909,11 @@ jobs:
               public static float GetAxis(string n) { return Axis(n, false); }
               public static float GetAxisRaw(string n) { return Axis(n, true); }
 
+              // Teclado virtual: texto digitado no celular e "qualquer tecla"
+              public static string inputString { get { return Input.inputString + TouchControls.Typed; } }
+              public static bool anyKeyDown { get { return Input.anyKeyDown || TouchControls.AnyPressed; } }
+              public static bool anyKey { get { return Input.anyKey || TouchControls.AnyDown; } }
+
               // Usado nos scripts de camera: olhar pelo toque, sem joystick/teclas virtuais.
               public static float CamAxis(string n)
               {
@@ -681,11 +941,12 @@ jobs:
           public static class MobileTune
           {
               const int Fps = 30;              // limite de quadros por segundo (30 = bem mais leve e fresco; se quiser mais fluido, use 60)
-              const float RenderScale = 0.6f;  // 1 = resolucao nativa; menor = mais leve
+              const float RenderScale = 0.5f;  // 1 = resolucao nativa; menor = mais leve (0.5 = metade; se achar borrado, suba pra 0.6)
               const int TextureLimit = 1;      // 0 = texturas cheias, 1 = metade (usa menos memoria)
               // sombras: sempre desligadas (sao as mais pesadas)
 
               static bool resized;
+              static bool timeTuned;
 
               [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
               static void Boot()
@@ -706,6 +967,7 @@ jobs:
 
               static void OnLoaded(UnityEngine.SceneManagement.Scene s, UnityEngine.SceneManagement.LoadSceneMode m)
               {
+                  Resources.UnloadUnusedAssets();
                   Apply();
                   MobileFixer.RequestFull();
               }
@@ -732,6 +994,14 @@ jobs:
                   QualitySettings.shadows = ShadowQuality.Disable;
                   QualitySettings.masterTextureLimit = TextureLimit;
                   Application.targetFrameRate = Fps;
+                  QualitySettings.maximumLODLevel = 1;
+                  Application.backgroundLoadingPriority = ThreadPriority.Low;
+                  if (!timeTuned)
+                  {
+                      timeTuned = true;
+                      Time.fixedDeltaTime = 1f / 30f;   // fisica no mesmo ritmo do jogo (30 fps)
+                      Time.maximumDeltaTime = 0.1f;
+                  }
                   if (!resized && Screen.height > 540)
                   {
                       resized = true;
@@ -764,10 +1034,44 @@ jobs:
                   {
                       yield return w;
                       n++;
-                      if (full) { full = false; FixMaterials(); }
+                      if (full) { full = false; FixMaterials(); FixRenderers(); }
                       if (n % 3 == 0) { MobileTune.Apply(); FixParticles(); FixCameras(); FixLights(); }
+                      if (n % 8 == 0) FixRenderers();
                       WatchDream();
                   }
+              }
+
+              // Tira o que o toon simples nao usa: sombras, sondas de luz/reflexo, animacao fora da tela
+              // e particulas em excesso.
+              static void FixRenderers()
+              {
+                  try
+                  {
+                      Renderer[] rs = FindObjectsOfType<Renderer>();
+                      for (int i = 0; i < rs.Length; i++)
+                      {
+                          Renderer r = rs[i];
+                          if (r == null) continue;
+                          r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                          r.receiveShadows = false;
+                          r.reflectionProbeUsage = UnityEngine.Rendering.ReflectionProbeUsage.Off;
+                          r.lightProbeUsage = UnityEngine.Rendering.LightProbeUsage.Off;
+                          SkinnedMeshRenderer smr = r as SkinnedMeshRenderer;
+                          if (smr != null) smr.updateWhenOffscreen = false;
+                      }
+                      Animator[] an = FindObjectsOfType<Animator>();
+                      for (int i = 0; i < an.Length; i++)
+                          if (an[i] != null && an[i].cullingMode == AnimatorCullingMode.AlwaysAnimate)
+                              an[i].cullingMode = AnimatorCullingMode.CullUpdateTransforms;
+                      ParticleSystem[] pss = FindObjectsOfType<ParticleSystem>();
+                      for (int i = 0; i < pss.Length; i++)
+                      {
+                          if (pss[i] == null) continue;
+                          var main = pss[i].main;
+                          if (main.maxParticles > 150) main.maxParticles = 150;
+                      }
+                  }
+                  catch (System.Exception) { }
               }
 
               static void FixParticles()
@@ -795,6 +1099,17 @@ jobs:
 
               static void FixCameras()
               {
+                  try
+                  {
+                      Camera[] cb = Camera.allCameras;
+                      for (int i = 0; i < cb.Length; i++)
+                      {
+                          cb[i].allowHDR = false;
+                          cb[i].allowMSAA = false;
+                          if (cb[i].farClipPlane > 150f) cb[i].farClipPlane = 150f;
+                      }
+                  }
+                  catch (System.Exception) { }
                   if (KeepImageEffects) return;
                   try
                   {
@@ -931,6 +1246,7 @@ jobs:
           CSEOF
 
       - name: Criar shaders toon (contorno fino)
+        timeout-minutes: 5
         run: |
           mkdir -p project/Assets/Resources
           cat > project/Assets/Resources/NoOutlineToon.shader <<'SHEOF1'
@@ -1059,6 +1375,7 @@ jobs:
           SHEOF2
 
       - name: Trocar leituras de teclado pelas que aceitam toque
+        timeout-minutes: 5
         run: |
           cd project/Assets
           [ -d Scripts ] && cd Scripts
@@ -1069,6 +1386,7 @@ jobs:
           echo "Scripts que usam mouse direto (posicao/clique): $(grep -rlE --include=*.cs 'Input\.(mousePosition|GetMouseButton)' . | wc -l)"
 
       - name: Camera principal olha so pelo toque (ignora o joystick)
+        timeout-minutes: 5
         run: |
           cd project/Assets
           [ -d Scripts ] && cd Scripts
@@ -1079,7 +1397,16 @@ jobs:
           echo "--- arquivos que leem eixos Horizontal/Vertical/Mouse:"
           grep -rlE --include=*.cs 'TInput\.(GetAxis|GetAxisRaw|CamAxis)\("(Horizontal|Vertical|Mouse X|Mouse Y)"' . | head -30 || true
 
+      - name: Trocar inputString e anyKey pelas versoes com teclado virtual
+        timeout-minutes: 5
+        run: |
+          cd project/Assets
+          [ -d Scripts ] && cd Scripts
+          grep -rlZE --exclude-dir=Editor --exclude=TouchControls.cs --include=*.cs '(CF2Input|Input)\.(inputString|anyKeyDown|anyKey)\b' . | xargs -0 -r perl -pi -e 's/(?<![\.\w])(?:UnityEngine\.)?(?:CF2Input|Input)\.(inputString|anyKeyDown|anyKey)\b/TInput.$1/g'
+          echo "inputString/anyKey trocados: $(grep -rhoE --include=*.cs 'TInput\.(inputString|anyKeyDown|anyKey)\b' . | wc -l)"
+
       - name: Corrigir pasta de configuracao no Android
+        timeout-minutes: 5
         run: |
           cd project/Assets
           [ -d Scripts ] && cd Scripts
@@ -1087,6 +1414,7 @@ jobs:
           echo "persistentDataPath em: $(grep -rl --include=*.cs 'Application.persistentDataPath' . | wc -l) arquivos"
 
       - name: Ler a versao da Unity do projeto exportado
+        timeout-minutes: 5
         id: unityver
         run: |
           V=$(grep -m1 '^m_EditorVersion:' project/ProjectSettings/ProjectVersion.txt | sed 's/^m_EditorVersion:[[:space:]]*//' | tr -d '\r ')
@@ -1095,6 +1423,7 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Instalar a Unity do projeto (com modulo Android)
+        timeout-minutes: 60
         uses: RageAgainstThePixel/unity-setup@v1
         with:
           version-file: None
@@ -1102,26 +1431,120 @@ jobs:
           build-targets: Android
 
       - name: Ativar licenca Personal
+        timeout-minutes: 10
         uses: RageAgainstThePixel/activate-unity-license@v1
         with:
           license: personal
           username: "opsariel123@gmail.com"
           password: "Y_6anderes"
 
+      - name: Ligar o vigia anti-travamento do Unity
+        timeout-minutes: 5
+        run: |
+          cat > /tmp/vigia.sh <<'WDEOF'
+          #!/bin/bash
+          # Roda ao lado do build. Registra em /tmp/vigia.log e:
+          #  - se o APK ja foi gerado e o Unity nao fechou em 2 min, encerra o Unity;
+          #  - se o log do Unity ficar parado por 30 min, mostra o diagnostico e encerra tudo.
+          LOG=/tmp/vigia.log
+          START=$(date +%s)
+          SEEN=0
+          while true; do
+            sleep 60
+            NOW=$(date +%s)
+            if ! pgrep -f '/Editor/Unity' >/dev/null 2>&1; then
+              [ "$SEEN" = 1 ] && { echo "[vigia] Unity terminou sozinho." >> $LOG; exit 0; }
+              [ $((NOW-START)) -gt 7200 ] && exit 0
+              continue
+            fi
+            SEEN=1
+            NEWEST=$( { ls "$HOME/.config/unity3d/Editor.log"; find "$RUNNER_TEMP" "$GITHUB_WORKSPACE" -name '*.log' -size +1k; } 2>/dev/null | xargs -r ls -t 2>/dev/null | head -n 1)
+            M=$(stat -c %Y "$NEWEST" 2>/dev/null || echo $NOW)
+            IDLE=$((NOW-M))
+            echo "[vigia] $(date +%H:%M:%S) Unity vivo; log parado ha $((IDLE/60)) min ($NEWEST)" >> $LOG
+            tail -n 2 "$NEWEST" 2>/dev/null | cut -c1-200 | sed 's/^/[vigia]    /' >> $LOG
+            APK=$(ls "$GITHUB_WORKSPACE"/build/*.apk 2>/dev/null | head -n 1)
+            if [ -n "$APK" ] && [ $((NOW-$(stat -c %Y "$APK"))) -gt 120 ]; then
+              echo "[vigia] APK pronto, mas o Unity nao fechou. Encerrando o Unity." >> $LOG
+              pkill -9 -f '/Editor/Unity'; pkill -9 -f gradle; exit 0
+            fi
+            if [ "$IDLE" -gt 1800 ]; then
+              echo "[vigia] Log parado ha mais de 30 min: o Unity travou. Ultimas linhas:" >> $LOG
+              tail -n 40 "$NEWEST" >> $LOG 2>&1
+              ps aux --sort=-%cpu | head -n 15 >> $LOG
+              pkill -9 -f '/Editor/Unity'; pkill -9 -f gradle; exit 0
+            fi
+          done
+          WDEOF
+          chmod +x /tmp/vigia.sh
+          : > /tmp/vigia.log
+          setsid nohup /tmp/vigia.sh >/dev/null 2>&1 &
+          echo "Vigia ligado."
+
       - name: Compilar o APK
+        timeout-minutes: 110
+        continue-on-error: true
         uses: RageAgainstThePixel/unity-action@v1
         with:
           log-name: build-apk
-          args: -quit -batchmode -nographics -projectPath ${{ github.workspace }}/project -buildTarget Android -executeMethod CIBuild.Build
+          args: -quit -batchmode -nographics -accept-apiupdate -projectPath ${{ github.workspace }}/project -buildTarget Android -executeMethod CIBuild.Build
 
-      - name: Enviar o APK
+      - name: Preparar os logs (resumo pequeno + completo compactado)
+        if: always()
+        timeout-minutes: 10
+        run: |
+          mkdir -p logs && cd logs
+          if [ ! -f build-apk.log ]; then
+            SRC=$( { find "$GITHUB_WORKSPACE" "$RUNNER_TEMP" -name '*.log' -size +100k; ls "$HOME/.config/unity3d/Editor.log"; } 2>/dev/null | grep -v '/logs/' | xargs -r ls -t 2>/dev/null | head -n 1)
+            [ -n "$SRC" ] || { echo "Nenhum log do Unity encontrado."; exit 0; }
+            echo "Log do Unity: $SRC"
+            cp "$SRC" build-apk.log
+          fi
+          ls -lh build-apk.log
+          # 1) resumo: so erros e falhas, sem repeticao (abre na hora)
+          grep -aE "error CS[0-9]+|Exception|error:|Error:|FAILURE|Build Failed|BuildFailed|Aborting|Scripts have compiler errors|Build Finished|Build completed|fatal" build-apk.log \
+            | cut -c1-300 | awk '!seen[$0]++' | head -n 5000 > resumo-erros.log || true
+          # 2) fim do log (onde costuma estar o motivo da falha)
+          tail -n 300 build-apk.log | cut -c1-300 > ultimas-linhas.log
+          # 3) log completo compactado (bem menor para enviar e baixar)
+          gzip -3 -c build-apk.log > build-apk.log.gz
+          ls -lh resumo-erros.log ultimas-linhas.log build-apk.log.gz
+
+      - name: Guardar os logs (comece pelo resumo-erros.log)
+        if: always()
+        timeout-minutes: 15
         uses: actions/upload-artifact@v4
         with:
-          name: LoveCrush-Port-APK
+          name: unity-build-log
+          path: |
+            logs/resumo-erros.log
+            logs/ultimas-linhas.log
+            logs/build-apk.log.gz
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7
+
+      - name: Conferir se o APK foi gerado
+        timeout-minutes: 5
+        run: |
+          echo "--- relatorio do vigia:"; cat /tmp/vigia.log 2>/dev/null || true
+          if ls build/*.apk >/dev/null 2>&1; then
+            ls -lh build/*.apk
+          else
+            echo "::error::O APK nao foi gerado (Unity falhou ou travou). Veja o relatorio do vigia acima e o resumo de erros."
+            exit 1
+          fi
+
+      - name: Enviar o APK
+        timeout-minutes: 15
+        uses: actions/upload-artifact@v4
+        with:
+          name: YanLite-Simulator-2020-APK
           path: build/*.apk
           if-no-files-found: error
 
       - name: Diagnostico do Unity Hub
+        timeout-minutes: 5
         if: always()
         run: |
           dpkg -l | grep -i unityhub || echo "pacote unityhub NAO instalado"
@@ -1131,6 +1554,7 @@ jobs:
           apt-cache policy unityhub | head -10 || true
 
       - name: Resumo dos erros do Unity
+        timeout-minutes: 10
         if: failure()
         run: |
           LOGS="$HOME/.config/unity3d/Editor.log $(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE" "$HOME" -name '*.log' -size +200k 2>/dev/null | head -5)"
