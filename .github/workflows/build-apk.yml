@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     env:
-      RELEASE_TAG: ""
+      RELEASE_TAG: "jogos"
       ZIP_NAME: ProjetoUnity.zip
       APP_ID: com.HonokoDev.AgniezkaPort
     steps:
