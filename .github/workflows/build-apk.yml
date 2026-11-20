@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         description: "Tag da release onde esta o arquivo do jogo"
-        default: "jogo"
+        default: "SchoolCreator"
       arquivo:
         description: "Nome do arquivo do jogo (.zip ou .rar) dentro da release"
         default: "School Creator v2.zip"
