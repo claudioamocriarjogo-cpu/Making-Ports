@@ -1,0 +1,2423 @@
+name: Decompilar e Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da release onde esta o arquivo do jogo"
+        default: "jogo"
+      arquivo:
+        description: "Nome do arquivo do jogo (.zip ou .rar) dentro da release"
+        default: "Agniezka Sim 2.5.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      ZIP_NAME: projeto_unity.zip
+      APK_NAME: Agniezka Simulator.apk
+      APP_ID: com.HonokoDev.LoveCrushAndroid
+    steps:
+      - name: Verificacao previa (avisa os erros logo no comeco)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ARQ: ${{ inputs.arquivo }}
+        run: |
+          ERROS=0
+          erro() { echo "::error::$1"; ERROS=$((ERROS+1)); }
+          ok() { echo "OK: $1"; }
+
+          # 1) release e arquivo do jogo
+          ASSETS=""
+          if ASSETS=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>&1); then
+            if echo "$ASSETS" | grep -qxF "$ARQ"; then
+              ok "arquivo '$ARQ' encontrado na release '$TAG'"
+            elif echo "$ASSETS" | grep -qiE '\.(zip|rar)$'; then
+              echo "::warning::'$ARQ' nao esta na release; sera usado: $(echo "$ASSETS" | grep -iE '\.(zip|rar)$' | head -n 1)"
+            else
+              erro "A release '$TAG' nao tem nenhum .zip ou .rar do jogo (publique a release, nao deixe como rascunho)"
+            fi
+          else
+            erro "Release '$TAG' nao encontrada neste repositorio: $ASSETS"
+            ASSETS=""
+          fi
+
+          # 2) AssetRipper
+          if echo "$ASSETS" | grep -qi '^AssetRipper'; then
+            ok "AssetRipper encontrado na sua release"
+          elif gh release view -R AssetRipper/AssetRipper --json assets -q '.assets[].name' 2>/dev/null | grep -q '^AssetRipper_linux_x64'; then
+            ok "AssetRipper (Linux x64) disponivel no GitHub oficial"
+          else
+            erro "AssetRipper para Linux x64 nao encontrado (nem na sua release, nem no GitHub oficial)"
+          fi
+
+          # 3) servidores da Unity
+          if curl -fsSI --max-time 30 https://hub.unity3d.com/linux/keys/public >/dev/null 2>&1; then
+            ok "chave do Unity Hub acessivel"
+          else
+            erro "Nao consegui acessar hub.unity3d.com (necessario para instalar o Unity Hub)"
+          fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 https://services.api.unity.com/ || true)
+          if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+            ok "api da Unity acessivel (HTTP $CODE)"
+          else
+            erro "Nao consegui acessar services.api.unity.com (necessario para achar a versao da Unity)"
+          fi
+
+          # 4) espaco em disco (jogo + projeto exportado + Unity com Android)
+          LIVRE=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+          if [ "${LIVRE:-0}" -ge 30 ]; then
+            ok "espaco livre: ${LIVRE} GB"
+          else
+            erro "Pouco espaco livre (${LIVRE:-0} GB); sao necessarios pelo menos 30 GB"
+          fi
+
+          # 5) ferramentas basicas
+          for c in curl unzip zip perl gh; do
+            command -v "$c" >/dev/null 2>&1 || erro "Ferramenta ausente no runner: $c"
+          done
+
+          if [ "$ERROS" -gt 0 ]; then
+            echo "A verificacao previa encontrou $ERROS problema(s). Cancelando antes de gastar tempo."
+            exit 1
+          fi
+          echo "Verificacao previa concluida sem problemas."
+
+      - name: Instalar Unity Hub 3.22.6 (versao antiga, caminho /opt)
+        run: |
+          wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
+          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
+          printf 'Package: unityhub\nPin: version 3.22.6\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unityhub=3.22.6 ffmpeg xvfb
+          sudo sed -i 's/^\(.*DISPLAY=:.*XAUTHORITY=.*\)\( "\$@" \)2>&1$/\1\2/' /usr/bin/xvfb-run
+          if [ ! -x /opt/unityhub/unityhub ] && [ -x /usr/lib/unityhub/unityhub ]; then
+            sudo ln -s /usr/lib/unityhub /opt/unityhub
+          fi
+          printf '#!/bin/bash\nxvfb-run --auto-servernum /opt/unityhub/unityhub "$@" 2>/dev/null' | sudo tee /usr/bin/unity-hub >/dev/null
+          sudo chmod 777 /usr/bin/unity-hub
+          ls -la /opt/unityhub/unityhub
+
+      - name: Baixar o jogo da release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ARQ: ${{ inputs.arquivo }}
+        run: |
+          set -e
+          if ! command -v unrar >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends unrar || true
+          fi
+          if ! command -v unrar >/dev/null 2>&1; then
+            echo "unrar indisponivel; usando 7-Zip oficial"
+            wget -q https://www.7-zip.org/a/7z2301-linux-x64.tar.xz -O /tmp/7z.tar.xz
+            mkdir -p /tmp/7z && tar -xJf /tmp/7z.tar.xz -C /tmp/7z
+            sudo install -m755 /tmp/7z/7zz /usr/local/bin/7zz
+          fi
+          mkdir -p work/jogo
+          echo "Releases deste repositorio:"
+          gh release list -R "$GITHUB_REPOSITORY" --limit 20 || true
+          ASSETS=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' || true)
+          echo "Arquivos na release '$TAG':"
+          echo "${ASSETS:-(nenhum)}"
+          ZIP="$ARQ"
+          if ! echo "$ASSETS" | grep -qxF "$ZIP"; then
+            ZIP=$(echo "$ASSETS" | grep -iE '\.(zip|rar)$' | head -n 1 || true)
+          fi
+          test -n "$ZIP" || { echo "A release '$TAG' nao tem nenhum .zip ou .rar. Anexe o arquivo do jogo nela (e publique, nao deixe como rascunho) e rode de novo."; exit 1; }
+          echo "Usando: $ZIP"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$ZIP" -D work
+          case "$ZIP" in
+            *.rar|*.RAR)
+              if command -v unrar >/dev/null 2>&1; then
+                unrar x -idq -y "work/$ZIP" work/jogo/
+              else
+                7zz x -y -owork/jogo "work/$ZIP" >/dev/null
+              fi ;;
+            *) unzip -q "work/$ZIP" -d work/jogo ;;
+          esac
+          rm "work/$ZIP"
+          DATA=$(find work/jogo -maxdepth 3 -type d -name "*_Data" | head -1)
+          test -n "$DATA" || { echo "Pasta *_Data nao encontrada: isso nao parece um build Unity"; exit 1; }
+          GAME_DIR=$(dirname "$DATA")
+          echo "GAME_DIR=$(realpath "$GAME_DIR")" >> "$GITHUB_ENV"
+          echo "Jogo em: $GAME_DIR"
+          ls "$GAME_DIR"
+
+      - name: Obter o AssetRipper (da release do jogo ou do site oficial)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          mkdir -p ripper
+          # 1) se voce anexou o AssetRipper na release do jogo, usa ele
+          RIP=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -i '^AssetRipper' | head -n 1 || true)
+          if [ -n "$RIP" ]; then
+            echo "Usando o AssetRipper da sua release: $RIP"
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$RIP" -D ripper
+          else
+            echo "AssetRipper nao esta na sua release; baixando do site oficial"
+            gh release download -R AssetRipper/AssetRipper -p "AssetRipper_linux_x64*" -D ripper
+          fi
+          F=$(find ripper -maxdepth 1 -type f | head -n 1)
+          echo "Arquivo: $F"
+          case "$F" in
+            *.tar.xz|*_tar.xz) tar -xJf "$F" -C ripper ;;
+            *.zip) unzip -q "$F" -d ripper ;;
+            *) echo "Formato nao reconhecido: $F"; exit 1 ;;
+          esac
+          BIN=$(find ripper -type f -name "AssetRipper.GUI.Free" | head -1)
+          test -n "$BIN" || { echo "Executavel do AssetRipper nao encontrado:"; find ripper -maxdepth 2; exit 1; }
+          chmod +x "$BIN"
+          echo "RIPPER_BIN=$(realpath "$BIN")" >> "$GITHUB_ENV"
+          ls -la "$(dirname "$BIN")"
+
+      - name: Iniciar o AssetRipper (sem janela)
+        run: |
+          nohup "$RIPPER_BIN" --headless --port 8080 > ripper.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fs -o /dev/null http://127.0.0.1:8080/; then echo "AssetRipper no ar"; exit 0; fi
+            sleep 2
+          done
+          echo "AssetRipper nao subiu. Log:"; cat ripper.log; exit 1
+
+      - name: Carregar e exportar o projeto Unity
+        run: |
+          set -e
+          mkdir -p work/saida
+          echo "Carregando $GAME_DIR"
+          curl -fsS --max-time 1800 -X POST http://127.0.0.1:8080/LoadFolder --data-urlencode "path=$GAME_DIR" -o /dev/null
+          echo "Exportando (pode levar varios minutos)..."
+          curl -fsS --max-time 5400 -X POST http://127.0.0.1:8080/Export/UnityProject --data-urlencode "path=$(realpath work/saida)" -o /dev/null
+          # garante a estrutura saida/ExportedProject
+          if [ ! -d work/saida/ExportedProject ]; then
+            PS=$(find work/saida -type f -path "*ProjectSettings/ProjectVersion.txt" | head -1)
+            test -n "$PS" || { echo "Exportacao vazia. Log do AssetRipper:"; tail -60 ripper.log; exit 1; }
+            PROJ=$(dirname "$(dirname "$PS")")
+            mv "$PROJ" work/ExportedProject
+            rm -rf work/saida && mkdir -p work/saida && mv work/ExportedProject work/saida/ExportedProject
+          fi
+          echo "--- ProjectVersion.txt:"
+          cat work/saida/ExportedProject/ProjectSettings/ProjectVersion.txt || true
+          echo "--- Resumo:"
+          du -sh work/saida
+          echo "Scripts .cs: $(find work/saida -name '*.cs' | wc -l)"
+          echo "Cenas: $(find work/saida -name '*.unity' | wc -l)"
+
+      - name: Parar o AssetRipper e liberar espaco
+        if: always()
+        run: |
+          pkill -f AssetRipper || true
+          rm -rf work/jogo ripper
+          df -h /
+
+      - name: Compactar o projeto exportado (projeto_unity.zip)
+        run: |
+          cd work
+          zip -qr -1 "$GITHUB_WORKSPACE/$ZIP_NAME" saida
+          ls -lh "$GITHUB_WORKSPACE/$ZIP_NAME"
+
+      - name: Disponibilizar o projeto_unity.zip para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: projeto_unity
+          path: projeto_unity.zip
+          compression-level: 0
+          retention-days: 14
+
+      - name: Arrumar o projeto para o build
+        run: |
+          set -e
+          PROJECT="work/saida/ExportedProject"
+          test -d "$PROJECT/Assets" || { echo "Pasta Assets nao encontrada no projeto exportado"; exit 1; }
+          mv "$PROJECT" "$GITHUB_WORKSPACE/project"
+          rm -rf work "$GITHUB_WORKSPACE/$ZIP_NAME"
+          rm -rf project/Library project/obj project/.vs
+          cat project/ProjectSettings/ProjectVersion.txt
+          # remove o cursor padrao do ProjectSettings (textura invalida derruba o Unity no build)
+          grep -nE '^\s*(defaultCursor|cursorHotspot):' project/ProjectSettings/ProjectSettings.asset || true
+          sed -i -E 's/^(\s*defaultCursor:).*/\1 {fileID: 0}/; s/^(\s*cursorHotspot:).*/\1 {x: 0, y: 0}/' project/ProjectSettings/ProjectSettings.asset
+          mkdir -p project/Assets/Resources
+          echo "Scripts C#: $(find project/Assets -type f -name '*.cs' | wc -l)"
+          echo "Shaders: $(find project/Assets -type f \( -iname '*.shader' -o -iname '*.compute' \) | wc -l)"
+          ls project
+          df -h /
+
+      - name: Baixar as texturas dos botoes da release (opcional)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          DEST=project/Assets/Resources/TouchButtons
+          TMP="$RUNNER_TEMP/botoes"
+          mkdir -p "$DEST" "$TMP"
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.png' --dir "$TMP" --clobber || echo "Nenhum PNG na release"
+          else
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern '*.png' --dir "$TMP" --clobber || echo "Nenhum PNG na release"
+          fi
+          FALLBACK=""
+          for f in "$TMP"/*; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            n=$(echo "${b%.*}" | tr 'A-Z' 'a-z')
+            case "$n" in
+              joyback|joy_back|joy-back|joystickback|joystick_back|joystick-back) cp "$f" "$DEST/joy_back.png"; echo "Base do joystick: $b -> joy_back.png"; continue ;;
+              joyhead|joy_head|joy-head|joystickhead|joystick_head|joystick-head) cp "$f" "$DEST/joy_head.png"; echo "Cabeca do joystick: $b -> joy_head.png"; continue ;;
+              e|q|r|f|c|1|2|3) k="$n" ;;
+              shift|left_shift|leftshift) k=shift ;;
+              enter|return) k=enter ;;
+              tab) k=tab ;;
+              ctrl|control) k=ctrl ;;
+              ";"|semicolon|pontoevirgula|ponto_virgula|ponto-virgula|pontovirgula) k=semicolon ;;
+              # o GitHub troca caracteres especiais no nome do arquivo: ";.png" pode virar ".png" ou "default.png"
+              ""|"."|default) FALLBACK="$f"; echo "'$b' sera usado para a tecla ; se nao houver outro"; continue ;;
+              *) echo "Ignorado (nome nao reconhecido): $b"; continue ;;
+            esac
+            cp "$f" "$DEST/btn_$k.png"
+            echo "Botao customizado: $b -> btn_$k.png"
+          done
+          if [ -n "$FALLBACK" ] && [ ! -f "$DEST/btn_semicolon.png" ]; then
+            cp "$FALLBACK" "$DEST/btn_semicolon.png"
+            echo "Botao customizado: $(basename "$FALLBACK") -> btn_semicolon.png"
+          fi
+          echo "Botoes customizados: $(ls "$DEST" 2>/dev/null | grep -c '\.png$')"
+
+      - name: Criar script de build do Editor
+        run: |
+          mkdir -p project/Assets/Editor
+          cat > project/Assets/Editor/CIBuild.cs <<'EOF'
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEngine;
+
+          public static class CIBuild
+          {
+              public static void Build()
+              {
+                  string appId = System.Environment.GetEnvironmentVariable("APP_ID");
+                  string workspace = System.Environment.GetEnvironmentVariable("GITHUB_WORKSPACE");
+
+                  // Cursor padrao invalido derruba o Unity (sinal 11) no fim do build
+                  PlayerSettings.defaultCursor = null;
+                  PlayerSettings.cursorHotspot = Vector2.zero;
+
+                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, appId);
+                  PlayerSettings.bundleVersion = "0.1";
+                  PlayerSettings.Android.bundleVersionCode = 1;
+                  PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel22;
+                  PlayerSettings.Android.targetSdkVersion = AndroidSdkVersions.AndroidApiLevelAuto;
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARMv7 | AndroidArchitecture.ARM64;
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
+                  PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new UnityEngine.Rendering.GraphicsDeviceType[] { UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 });
+                  PlayerSettings.SetManagedStrippingLevel(BuildTargetGroup.Android, ManagedStrippingLevel.Disabled);
+                  PlayerSettings.Android.useCustomKeystore = false;
+                  PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, Il2CppCompilerConfiguration.Release);
+                  PlayerSettings.SetMobileMTRendering(BuildTargetGroup.Android, true);
+                  PlayerSettings.gpuSkinning = true;
+                  EditorUserBuildSettings.buildAppBundle = false;
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                  PlayerSettings.allowedAutorotateToPortrait = false;
+                  PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                  PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                  PlayerSettings.allowedAutorotateToLandscapeRight = true;
+
+                  // Qualidade Low (nivel 0) como padrao no Android
+                  try
+                  {
+                      Object[] qa = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/QualitySettings.asset");
+                      if (qa != null && qa.Length > 0)
+                      {
+                          SerializedObject qso = new SerializedObject(qa[0]);
+                          SerializedProperty pq = qso.FindProperty("m_PerPlatformDefaultQuality");
+                          if (pq != null)
+                          {
+                              for (int qi = 0; qi < pq.arraySize; qi++)
+                              {
+                                  SerializedProperty sec = pq.GetArrayElementAtIndex(qi).FindPropertyRelative("second");
+                                  if (sec != null) sec.intValue = 0;
+                              }
+                              qso.ApplyModifiedPropertiesWithoutUndo();
+                          }
+                      }
+                  }
+                  catch (System.Exception e) { Debug.LogWarning("Qualidade padrao nao ajustada: " + e.Message); }
+
+                  // Texturas customizadas dos botoes: sem mipmap, sem compressao, sem escalar para potencia de 2
+                  try
+                  {
+                      foreach (string guid in AssetDatabase.FindAssets("t:Texture2D", new[] { "Assets/Resources/TouchButtons" }))
+                      {
+                          string path = AssetDatabase.GUIDToAssetPath(guid);
+                          TextureImporter ti = AssetImporter.GetAtPath(path) as TextureImporter;
+                          if (ti == null) continue;
+                          ti.textureType = TextureImporterType.GUI;
+                          ti.mipmapEnabled = false;
+                          ti.npotScale = TextureImporterNPOTScale.None;
+                          ti.alphaIsTransparency = true;
+                          ti.textureCompression = TextureImporterCompression.Uncompressed;
+                          ti.maxTextureSize = 256;   // o botao na tela tem ~130-220 px; PNG maior que isso e reduzido ja na importacao
+                          ti.filterMode = FilterMode.Bilinear;
+                          ti.SaveAndReimport();
+                          Debug.Log("Botao customizado importado: " + path);
+                      }
+                  }
+                  catch (System.Exception e) { Debug.LogWarning("Botoes customizados nao importados: " + e.Message); }
+
+                  string[] scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
+                  if (scenes.Length == 0)
+                  {
+                      Debug.LogWarning("Nenhuma cena ativa no Build Settings. Usando todas as cenas de Assets.");
+                      scenes = AssetDatabase.FindAssets("t:Scene").Select(AssetDatabase.GUIDToAssetPath).Where(p => p.StartsWith("Assets/")).ToArray();
+                  }
+                  Debug.Log("Cenas no build: " + scenes.Length);
+
+                  string outDir = Path.Combine(workspace, "build");
+                  Directory.CreateDirectory(outDir);
+
+                  var options = new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = Path.Combine(outDir, "Agniezka Simulator.apk"),
+                      target = BuildTarget.Android,
+                      options = BuildOptions.CompressWithLz4
+                  };
+
+                  var report = BuildPipeline.BuildPlayer(options);
+                  if (report.summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
+                  {
+                      EditorApplication.Exit(1);
+                  }
+              }
+          }
+          EOF
+
+      - name: Criar camada de toque (joystick e botoes)
+        run: |
+          cat > project/Assets/TouchControls.cs <<'CSEOF'
+          using System.Collections;
+          using System.Collections.Generic;
+          using UnityEngine;
+
+          // Camada de toque: joystick (esquerda), botoes (direita) e olhar arrastando a tela.
+          [DefaultExecutionOrder(-10000)]
+          public class TouchControls : MonoBehaviour
+          {
+              public static Vector2 Move;
+              public static Vector2 Look;
+
+              static TouchControls instance;
+              const bool ShowDebug = false;
+              static string lastKey = "-";
+              static bool shiftOn; // Shift vira liga/desliga: 1 toque corre, outro toque anda
+              static int errCount;
+              static int updatedFrame;
+              static readonly Dictionary<KeyCode, int> pressSeen = new Dictionary<KeyCode, int>();
+              static readonly Dictionary<KeyCode, int> releaseSeen = new Dictionary<KeyCode, int>();
+              static string lastError = "";
+              GUIStyle dbgStyle;
+              static readonly Dictionary<KeyCode, bool> down = new Dictionary<KeyCode, bool>();
+              static readonly Dictionary<KeyCode, int> pressedFrame = new Dictionary<KeyCode, int>();
+              static readonly Dictionary<KeyCode, int> releasedFrame = new Dictionary<KeyCode, int>();
+
+              class Btn
+              {
+                  public string label;
+                  public KeyCode key;
+                  public Rect r;
+                  public int finger = -1;
+                  public bool wasHeld;
+                  public Texture2D tex;   // textura customizada (Resources/TouchButtons/btn_<tecla>.png), se existir
+              }
+
+              readonly List<Btn> btns = new List<Btn>();
+              Texture2D circle;
+              Texture2D joyBackTex;   // JoyBack.png: base do joystick (Resources/TouchButtons/joy_back.png)
+              Texture2D joyHeadTex;   // JoyHead.png: o que se segura com o dedo (Resources/TouchButtons/joy_head.png)
+              GUIStyle style;
+              Vector2 joyCenter;
+              float joyRadius;
+              float unit;
+              int joyFinger = -1;
+              int lookFinger = -1;
+              const float LookScale = 0.12f;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+              static void Boot()
+              {
+                  if (Application.platform != RuntimePlatform.Android || instance != null) return;
+                  GameObject go = new GameObject("TouchControls");
+                  DontDestroyOnLoad(go);
+                  instance = go.AddComponent<TouchControls>();
+              }
+
+              public static bool IsDown(KeyCode k) { bool v; return down.TryGetValue(k, out v) && v; }
+              // GetKeyDown/Up virtual. O codigo normal (Update) enxerga o toque no proprio quadro.
+              // Ja a fisica (OnTriggerStay, FixedUpdate...) roda ANTES do Update do quadro, entao recebe
+              // o toque uma unica vez, no primeiro passo de fisica depois dele.
+              static bool Edge(Dictionary<KeyCode, int> frames, Dictionary<KeyCode, int> seenMap, KeyCode k)
+              {
+                  int f;
+                  if (!frames.TryGetValue(k, out f)) return false;
+                  int fc = Time.frameCount;
+                  if (updatedFrame == fc) return f == fc;
+                  if (f >= fc) return false;
+                  int seen;
+                  if (seenMap.TryGetValue(k, out seen) && seen >= f) return seen == fc;
+                  if (fc - f > 10) return false;
+                  seenMap[k] = fc;
+                  return true;
+              }
+
+              public static bool WasPressed(KeyCode k) { return Edge(pressedFrame, pressSeen, k); }
+              public static bool WasReleased(KeyCode k) { return Edge(releasedFrame, releaseSeen, k); }
+
+              static void SetKey(KeyCode k, bool on)
+              {
+                  bool cur;
+                  down.TryGetValue(k, out cur);
+                  if (on == cur) return;
+                  down[k] = on;
+                  if (on) { pressedFrame[k] = Time.frameCount; lastKey = k.ToString(); }
+                  else releasedFrame[k] = Time.frameCount;
+              }
+
+              static void OnLog(string cond, string stack, LogType type)
+              {
+                  if (type != LogType.Exception && type != LogType.Error) return;
+                  errCount++;
+                  lastError = cond.Length > 140 ? cond.Substring(0, 140) : cond;
+              }
+
+              // Nome do arquivo de textura de cada tecla (E.png, Enter.png, Tab.png, Ctrl.png, ;.png ...)
+              static string TexName(KeyCode k)
+              {
+                  switch (k)
+                  {
+                      case KeyCode.Return: return "enter";
+                      case KeyCode.Tab: return "tab";
+                      case KeyCode.LeftControl: return "ctrl";
+                      case KeyCode.LeftShift: return "shift";
+                      case KeyCode.Semicolon: return "semicolon";
+                      case KeyCode.Alpha1: return "1";
+                      case KeyCode.Alpha2: return "2";
+                      case KeyCode.Alpha3: return "3";
+                      default: return k.ToString().ToLowerInvariant();
+                  }
+              }
+
+              void AddBtn(string label, KeyCode key)
+              {
+                  Btn b = new Btn();
+                  b.label = label;
+                  b.key = key;
+                  try { b.tex = Resources.Load<Texture2D>("TouchButtons/btn_" + TexName(key)); }
+                  catch (System.Exception) { b.tex = null; }
+                  btns.Add(b);
+              }
+
+              void Awake()
+              {
+                  circle = MakeCircle(128);
+                  try { joyBackTex = Resources.Load<Texture2D>("TouchButtons/joy_back"); }
+                  catch (System.Exception) { joyBackTex = null; }
+                  try { joyHeadTex = Resources.Load<Texture2D>("TouchButtons/joy_head"); }
+                  catch (System.Exception) { joyHeadTex = null; }
+                  Application.logMessageReceived += OnLog;
+                  // Linha de cima (canto superior direito): Enter Tab 1 2 3
+                  AddBtn("Enter", KeyCode.Return);
+                  AddBtn("Tab", KeyCode.Tab);
+                  AddBtn("1", KeyCode.Alpha1);
+                  AddBtn("2", KeyCode.Alpha2);
+                  AddBtn("3", KeyCode.Alpha3);
+                  // Grade de baixo (canto inferior direito), linha de cima: Q E R F
+                  AddBtn("Q", KeyCode.Q);
+                  AddBtn("E", KeyCode.E);
+                  AddBtn("R", KeyCode.R);
+                  AddBtn("F", KeyCode.F);
+                  // linha de baixo: C Ctrl ;
+                  AddBtn("C", KeyCode.C);
+                  AddBtn("Ctrl", KeyCode.LeftControl);
+                  AddBtn(";", KeyCode.Semicolon);
+                  // Shift (correr, liga/desliga): fica acima do joystick, fora da grade
+                  AddBtn("Shift", KeyCode.LeftShift);
+                  Layout();
+              }
+
+              void Layout()
+              {
+                  float w = Screen.width;
+                  float h = Screen.height;
+                  unit = Mathf.Min(w, h) * 0.15f;
+                  float g = unit * 0.1f;
+                  float m = unit * 0.3f;
+                  joyRadius = unit * 1.1f;
+                  joyCenter = new Vector2(m + joyRadius * 1.1f, m + joyRadius * 1.1f);
+                  // 5 botoes pequenos no canto superior direito
+                  float s = unit * 0.8f;
+                  for (int i = 0; i < 5; i++)
+                  {
+                      float x = w - m - s - (4 - i) * (s + g);
+                      float y = h - m - s;
+                      btns[i].r = new Rect(x, y, s, s);
+                  }
+                  // grade 4 colunas x 2 linhas no canto inferior direito (o Shift nao entra na grade)
+                  int gi = 0;
+                  for (int i = 5; i < btns.Count; i++)
+                  {
+                      if (btns[i].key == KeyCode.LeftShift) continue;
+                      int k = gi++;
+                      int row = k / 4;
+                      int col = k % 4 + (row == 1 ? 1 : 0);   // 2a linha (3 botoes) encostada na direita
+                      float x = w - m - unit - (3 - col) * (unit + g);
+                      float y = m + (1 - row) * (unit + g);
+                      btns[i].r = new Rect(x, y, unit, unit);
+                  }
+                  // Shift: acima do joystick, longe o bastante para o joystick nao pegar o toque dele
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      if (btns[i].key != KeyCode.LeftShift) continue;
+                      btns[i].r = new Rect(joyCenter.x - unit * 0.5f, joyCenter.y + unit * 2.1f, unit, unit);
+                  }
+              }
+
+              void Begin(Touch t)
+              {
+                  Vector2 p = t.position;
+                  if (joyFinger < 0 && (p - joyCenter).magnitude < joyRadius * 1.7f)
+                  {
+                      joyFinger = t.fingerId;
+                      return;
+                  }
+                  float pad = unit * 0.1f;
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Rect b = btns[i].r;
+                      Rect r = new Rect(b.x - pad, b.y - pad, b.width + pad * 2f, b.height + pad * 2f);
+                      if (btns[i].finger < 0 && r.Contains(p))
+                      {
+                          btns[i].finger = t.fingerId;
+                          return;
+                      }
+                  }
+                  if (lookFinger < 0 && p.x > Screen.width * 0.3f) lookFinger = t.fingerId;
+              }
+
+              void End(int id)
+              {
+                  if (joyFinger == id) joyFinger = -1;
+                  if (lookFinger == id) lookFinger = -1;
+                  for (int i = 0; i < btns.Count; i++)
+                      if (btns[i].finger == id) btns[i].finger = -1;
+              }
+
+              void Hold(Touch t)
+              {
+                  if (t.fingerId == joyFinger)
+                  {
+                      Vector2 v = (t.position - joyCenter) / joyRadius;
+                      if (v.magnitude > 1f) v = v.normalized;
+                      if (v.magnitude < 0.15f) v = Vector2.zero;
+                      Move = v;
+                  }
+                  else if (t.fingerId == lookFinger)
+                  {
+                      Look += t.deltaPosition * LookScale;
+                  }
+              }
+
+              void Update()
+              {
+                  Layout();
+                  Look = Vector2.zero;
+                  Touch[] touches = Input.touches;
+                  if (touches.Length == 0)
+                  {
+                      joyFinger = -1;
+                      lookFinger = -1;
+                      for (int i = 0; i < btns.Count; i++) btns[i].finger = -1;
+                  }
+                  for (int i = 0; i < touches.Length; i++)
+                  {
+                      Touch t = touches[i];
+                      if (t.phase == TouchPhase.Began) Begin(t);
+                      if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) End(t.fingerId);
+                      else Hold(t);
+                  }
+                  if (joyFinger < 0) Move = Vector2.zero;
+                  SetKey(KeyCode.W, Move.y > 0.5f);
+                  SetKey(KeyCode.S, Move.y < -0.5f);
+                  SetKey(KeyCode.A, Move.x < -0.5f);
+                  SetKey(KeyCode.D, Move.x > 0.5f);
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Btn b = btns[i];
+                      bool held = b.finger >= 0;
+                      if (b.key == KeyCode.LeftShift)
+                      {
+                          if (held && !b.wasHeld) shiftOn = !shiftOn;
+                          SetKey(b.key, shiftOn);
+                      }
+                      else SetKey(b.key, held);
+                      b.wasHeld = held;
+                  }
+                  updatedFrame = Time.frameCount;
+              }
+
+              void OnGUI()
+              {
+                  if (style == null)
+                  {
+                      style = new GUIStyle(GUI.skin.label);
+                      style.alignment = TextAnchor.MiddleCenter;
+                      style.normal.textColor = Color.white;
+                  }
+                  if (Event.current.type != EventType.Repaint) return;
+                  float h = Screen.height;
+                  style.fontSize = Mathf.RoundToInt(unit * 0.27f);
+                  // Joystick: base (JoyBack.png) fixa e cabeca (JoyHead.png) que acompanha o dedo.
+                  // Sem os PNG, desenha os circulos de antes.
+                  Rect baseRect = new Rect(joyCenter.x - joyRadius, h - joyCenter.y - joyRadius, joyRadius * 2f, joyRadius * 2f);
+                  if (joyBackTex != null)
+                  {
+                      GUI.color = Color.white;
+                      GUI.DrawTexture(baseRect, joyBackTex, ScaleMode.ScaleToFit, true);
+                  }
+                  else
+                  {
+                      GUI.color = new Color(1f, 1f, 1f, 0.45f);
+                      GUI.DrawTexture(baseRect, circle);
+                  }
+                  Vector2 k = joyCenter + Move * joyRadius * 0.6f;
+                  float kr = joyRadius * 0.42f;
+                  Rect headRect = new Rect(k.x - kr, h - k.y - kr, kr * 2f, kr * 2f);
+                  if (joyHeadTex != null)
+                  {
+                      GUI.color = Color.white;
+                      GUI.DrawTexture(headRect, joyHeadTex, ScaleMode.ScaleToFit, true);
+                  }
+                  else
+                  {
+                      GUI.color = new Color(1f, 1f, 1f, 0.8f);
+                      GUI.DrawTexture(headRect, circle);
+                  }
+                  for (int i = 0; i < btns.Count; i++)
+                  {
+                      Btn b = btns[i];
+                      Rect gr = new Rect(b.r.x, h - b.r.yMax, b.r.width, b.r.height);
+                      bool on = b.finger >= 0 || (b.key == KeyCode.LeftShift && shiftOn);
+                      if (b.tex != null)
+                      {
+                          // A textura sempre se encaixa no retangulo original do botao (gr): PNG grande e reduzido,
+                          // PNG pequeno e ampliado, mantendo a proporcao e centralizado
+                          Rect tr = gr;
+                          if (on)
+                          {
+                              float ins = gr.width * 0.06f;
+                              tr = new Rect(gr.x + ins, gr.y + ins, gr.width - ins * 2f, gr.height - ins * 2f);
+                          }
+                          GUI.color = on ? new Color(0.8f, 0.8f, 0.8f, 1f) : Color.white;
+                          GUI.DrawTexture(tr, b.tex, ScaleMode.ScaleToFit, true);
+                      }
+                      else
+                      {
+                          GUI.color = new Color(1f, 1f, 1f, on ? 0.95f : 0.5f);
+                          GUI.DrawTexture(gr, circle);
+                          GUI.color = Color.white;
+                          GUI.Label(gr, b.label, style);
+                      }
+                  }
+                  GUI.color = Color.white;
+                  if (ShowDebug)
+                  {
+                      if (dbgStyle == null)
+                      {
+                          dbgStyle = new GUIStyle(GUI.skin.label);
+                          dbgStyle.alignment = TextAnchor.UpperLeft;
+                          dbgStyle.wordWrap = true;
+                          dbgStyle.normal.textColor = Color.yellow;
+                      }
+                      dbgStyle.fontSize = Mathf.RoundToInt(unit * 0.2f);
+                      GUI.Label(new Rect(Screen.width * 0.18f, 4f, Screen.width * 0.64f, unit * 1.2f), "tecla: " + lastKey + " | erros: " + errCount + "\n" + lastError, dbgStyle);
+                  }
+              }
+
+              static Texture2D MakeCircle(int s)
+              {
+                  Texture2D t = new Texture2D(s, s, TextureFormat.RGBA32, false);
+                  float c = (s - 1) * 0.5f;
+                  float r = s * 0.5f;
+                  Color[] px = new Color[s * s];
+                  for (int y = 0; y < s; y++)
+                  {
+                      for (int x = 0; x < s; x++)
+                      {
+                          float d = Mathf.Sqrt((x - c) * (x - c) + (y - c) * (y - c)) / r;
+                          float edge = Mathf.Clamp01((1f - d) * r);
+                          float a = (d > 0.93f ? 1f : 0.35f) * edge;
+                          px[y * s + x] = new Color(1f, 1f, 1f, a);
+                      }
+                  }
+                  t.SetPixels(px);
+                  t.Apply();
+                  t.filterMode = FilterMode.Bilinear;
+                  return t;
+              }
+          }
+
+          // Substitui Input.GetKey*/GetAxis* pelas versoes que tambem aceitam o toque.
+          public static class TInput
+          {
+              public static bool GetKey(KeyCode k) { return Input.GetKey(k) || TouchControls.IsDown(k); }
+              public static bool GetKeyDown(KeyCode k) { return Input.GetKeyDown(k) || TouchControls.WasPressed(k); }
+              public static bool GetKeyUp(KeyCode k) { return Input.GetKeyUp(k) || TouchControls.WasReleased(k); }
+              // Nome de tecla em texto ("return", "tab", "left ctrl", ";", "e", "1"...) -> KeyCode
+              static bool ToKey(string n, out KeyCode k)
+              {
+                  k = KeyCode.None;
+                  if (string.IsNullOrEmpty(n)) return false;
+                  n = n.ToLowerInvariant();
+                  switch (n)
+                  {
+                      case "return": case "enter": k = KeyCode.Return; return true;
+                      case "tab": k = KeyCode.Tab; return true;
+                      case "left ctrl": k = KeyCode.LeftControl; return true;
+                      case "left shift": k = KeyCode.LeftShift; return true;
+                      case "space": k = KeyCode.Space; return true;
+                      case ";": k = KeyCode.Semicolon; return true;
+                  }
+                  if (n.Length == 1)
+                  {
+                      char c = n[0];
+                      if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) { k = (KeyCode)(int)c; return true; }
+                  }
+                  return false;
+              }
+
+              public static bool GetKey(string n)
+              {
+                  KeyCode k;
+                  if (ToKey(n, out k) && TouchControls.IsDown(k)) return true;
+                  try { return Input.GetKey(n); } catch (System.Exception) { return false; }
+              }
+              public static bool GetKeyDown(string n)
+              {
+                  KeyCode k;
+                  if (ToKey(n, out k) && TouchControls.WasPressed(k)) return true;
+                  try { return Input.GetKeyDown(n); } catch (System.Exception) { return false; }
+              }
+              public static bool GetKeyUp(string n)
+              {
+                  KeyCode k;
+                  if (ToKey(n, out k) && TouchControls.WasReleased(k)) return true;
+                  try { return Input.GetKeyUp(n); } catch (System.Exception) { return false; }
+              }
+              public static float GetAxis(string n) { return Axis(n, false); }
+              public static float GetAxisRaw(string n) { return Axis(n, true); }
+
+              // Usado nos scripts de camera: olhar pelo toque, sem joystick/teclas virtuais.
+              public static float CamAxis(string n)
+              {
+                  if (n == "Mouse X" || n == "Mouse Y") return Axis(n, false);
+                  try { return Input.GetAxis(n); } catch (System.Exception) { return 0f; }
+              }
+
+              static float Axis(string n, bool raw)
+              {
+                  float v;
+                  try { v = raw ? Input.GetAxisRaw(n) : Input.GetAxis(n); }
+                  catch (System.Exception) { return 0f; }
+                  if (n == "Horizontal") return Mathf.Clamp(v + TouchControls.Move.x, -1f, 1f);
+                  if (n == "Vertical") return Mathf.Clamp(v + TouchControls.Move.y, -1f, 1f);
+                  // No Android o Unity transforma QUALQUER dedo em "mouse" (inclusive o do joystick).
+                  // Por isso o mouse e ignorado aqui: a camera so olha pelo dedo de olhar.
+                  if (n == "Mouse X") return Application.platform == RuntimePlatform.Android ? TouchControls.Look.x : v;
+                  if (n == "Mouse Y") return Application.platform == RuntimePlatform.Android ? TouchControls.Look.y : v;
+                  return v;
+              }
+          }
+
+          // Ajustes de desempenho e correcoes para celulares de entrada (ex.: Moto G24).
+          // Mexa nos valores abaixo pra equilibrar qualidade x desempenho.
+          public static class MobileTune
+          {
+              const int Fps = 30;              // limite de quadros por segundo (30 = bem mais leve e fresco; se quiser mais fluido, use 60)
+              const float RenderScale = 0.6f;  // 1 = resolucao nativa; menor = mais leve
+              const int TextureLimit = 1;      // 0 = texturas cheias, 1 = metade (usa menos memoria)
+              // sombras: sempre desligadas (sao as mais pesadas)
+
+              static bool resized;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              static void Boot()
+              {
+                  if (Application.platform != RuntimePlatform.Android) return;
+                  UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnLoaded;
+                  Apply();
+              }
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+              static void BootFixer()
+              {
+                  if (Application.platform != RuntimePlatform.Android) return;
+                  GameObject go = new GameObject("MobileFixer");
+                  Object.DontDestroyOnLoad(go);
+                  go.AddComponent<MobileFixer>();
+              }
+
+              static void OnLoaded(UnityEngine.SceneManagement.Scene s, UnityEngine.SceneManagement.LoadSceneMode m)
+              {
+                  Apply();
+                  MobileFixer.RequestFull();
+              }
+
+              public static void Apply()
+              {
+                  // Qualidade sempre no nivel mais baixo (Low), mesmo se o jogo tentar mudar
+                  if (QualitySettings.GetQualityLevel() != 0) QualitySettings.SetQualityLevel(0, true);
+                  Screen.sleepTimeout = SleepTimeout.NeverSleep;
+                  QualitySettings.vSyncCount = 0;
+                  QualitySettings.antiAliasing = 0;
+                  QualitySettings.anisotropicFiltering = AnisotropicFiltering.Disable;
+                  QualitySettings.pixelLightCount = 1;
+                  QualitySettings.softParticles = false;
+                  QualitySettings.realtimeReflectionProbes = false;
+                  QualitySettings.skinWeights = SkinWeights.TwoBones;
+                  QualitySettings.lodBias = 0.6f;
+                  QualitySettings.shadowDistance = 0f;
+                  QualitySettings.shadowCascades = 0;
+                  QualitySettings.billboardsFaceCameraPosition = false;
+                  QualitySettings.particleRaycastBudget = 16;
+                  QualitySettings.asyncUploadTimeSlice = 4;
+                  QualitySettings.asyncUploadBufferSize = 16;
+                  QualitySettings.shadows = ShadowQuality.Disable;
+                  QualitySettings.masterTextureLimit = TextureLimit;
+                  Application.targetFrameRate = Fps;
+                  if (!resized && Screen.height > 540)
+                  {
+                      resized = true;
+                      int h = Mathf.RoundToInt(Screen.height * RenderScale);
+                      int w = Mathf.RoundToInt(Screen.width * RenderScale);
+                      Screen.SetResolution(w, h, true);
+                  }
+              }
+          }
+
+          // Corrige dois problemas do port:
+          // 1) O shader das particulas usa GPU instancing (SSBO no vertex shader), que o Mali nao suporta
+          //    (erro "vertex shader storage blocks (1) is greater than the maximum (0)"). Desligamos.
+          // 2) Todos os shaders do jogo sao trocados por um toon simples e leve (contorno fino so nos personagens).
+          public class MobileFixer : MonoBehaviour
+          {
+                        // Efeitos de camera (SSAO, Bloom, MotionBlur, AntiAliasing): pesados no celular e podem
+              // deixar a cena Dream toda branca. false = desligados.
+              const bool KeepImageEffects = false;
+              static bool full = true;
+              static float whiteSince = -1f;
+
+              public static void RequestFull() { full = true; }
+
+              IEnumerator Start()
+              {
+                  WaitForSeconds w = new WaitForSeconds(1.5f);
+                  int n = 0;
+                  while (true)
+                  {
+                      yield return w;
+                      n++;
+                      if (full) { full = false; FixMaterials(); FixUi(); }
+                          if (n % 6 == 0) FixUi();
+                      if (n % 3 == 0) { MobileTune.Apply(); FixParticles(); FixCameras(); FixLights(); }
+                      WatchDream();
+                  }
+              }
+
+              static void FixParticles()
+              {
+                  try
+                  {
+                      ParticleSystemRenderer[] ps = Resources.FindObjectsOfTypeAll<ParticleSystemRenderer>();
+                      for (int i = 0; i < ps.Length; i++)
+                          if (ps[i] != null && ps[i].enableGPUInstancing) ps[i].enableGPUInstancing = false;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              // Desliga sombras de todas as luzes
+              static void FixLights()
+              {
+                  try
+                  {
+                      Light[] ls = FindObjectsOfType<Light>();
+                      for (int i = 0; i < ls.Length; i++)
+                          if (ls[i] != null && ls[i].shadows != LightShadows.None) ls[i].shadows = LightShadows.None;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              static void FixCameras()
+              {
+                  if (KeepImageEffects) return;
+                  try
+                  {
+                      Camera[] cams = Camera.allCameras;
+                      for (int i = 0; i < cams.Length; i++)
+                      {
+                          MonoBehaviour[] mbs = cams[i].GetComponents<MonoBehaviour>();
+                          for (int j = 0; j < mbs.Length; j++)
+                          {
+                              if (mbs[j] == null || !mbs[j].enabled) continue;
+                              string t = mbs[j].GetType().Name;
+                              if (t.Contains("Bloom") || t.Contains("Blur") || t.Contains("SSAO") || t.Contains("AmbientOcc")
+                                  || t.Contains("ScreenSpace") || t.Contains("Antialiasing") || t.Contains("AntiAliasing")
+                                  || t.Contains("DepthOfField") || t.Contains("Vignette") || t.Contains("SunShafts")
+                                  || t.Contains("GlobalFog") || t.Contains("Tonemapping") || t.Contains("ColorCorrection")
+                                  || t.Contains("PostProcess") || t.Contains("NoiseAndGrain") || t.Contains("EdgeDetection"))
+                                  mbs[j].enabled = false;
+                          }
+                      }
+                  }
+                  catch (System.Exception) { }
+              }
+
+              // Se a tela da cena Dream ficar toda branca por mais de 8 segundos (imagem "White" do Fade
+              // que nao some), esconde essa imagem para o jogo continuar.
+              static void WatchDream()
+              {
+                  try
+                  {
+                      UnityEngine.SceneManagement.Scene sc = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+                      if (!sc.name.Contains("Dream")) { whiteSince = -1f; return; }
+                      UnityEngine.UI.Image[] imgs = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Image>();
+                      bool white = false;
+                      for (int i = 0; i < imgs.Length; i++)
+                      {
+                          UnityEngine.UI.Image im = imgs[i];
+                          if (im == null || im.name != "White" || !im.gameObject.activeInHierarchy) continue;
+                          if (im.color.a * im.canvasRenderer.GetAlpha() < 0.95f) continue;
+                          white = true;
+                          if (whiteSince < 0f) whiteSince = Time.unscaledTime;
+                          else if (Time.unscaledTime - whiteSince > 8f)
+                          {
+                              Color c = im.color;
+                              c.a = 0f;
+                              im.color = c;
+                              im.canvasRenderer.SetAlpha(0f);
+                              whiteSince = -1f;
+                          }
+                      }
+                      if (!white) whiteSince = -1f;
+                  }
+                  catch (System.Exception) { }
+              }
+
+              static Font fallbackFont;
+
+              // Textos e imagens da interface: poe uma fonte quando falta e tira materiais com shader quebrado
+              // (o texto TextMeshPro e corrigido pelos shaders proprios criados no passo "Corrigir shaders").
+              static void FixUi()
+              {
+                  try
+                  {
+                      UnityEngine.UI.Text[] ts = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Text>();
+                      for (int i = 0; i < ts.Length; i++)
+                      {
+                          UnityEngine.UI.Text t = ts[i];
+                          if (t == null || t.font != null) continue;
+                          if (fallbackFont == null) fallbackFont = Resources.GetBuiltinResource<Font>("Arial.ttf");
+                          t.font = fallbackFont;
+                      }
+
+                      UnityEngine.UI.Graphic[] gs = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Graphic>();
+                      for (int i = 0; i < gs.Length; i++)
+                      {
+                          UnityEngine.UI.Graphic g = gs[i];
+                          if (g == null) continue;
+                          if (g.GetType().Name.StartsWith("TextMeshPro")) continue;
+                          Material m = g.material;
+                          if (m == null || m.shader == null) continue;
+                          if (!m.shader.isSupported || m.shader.name == "Hidden/InternalErrorShader") g.material = null;
+                      }
+                  }
+                  catch (System.Exception) { }
+              }
+
+              static Shader toonShader;
+              static Shader invisibleShader;
+              const float OutlineWidth = 0.002f;        // espessura do contorno fino (0 = sem contorno)
+              const bool OutlineSoPersonagens = true;   // true = contorno so em personagens (bem mais leve)
+
+              // Shaders que NAO sao trocados (interface, texto, ceu, particulas)
+              static bool Keep(string n)
+              {
+                  if (n.StartsWith("UI/") || n.StartsWith("Sprites/") || n.StartsWith("GUI/") || n.StartsWith("TextMeshPro")) return true;
+                  if (n.StartsWith("Skybox") || n.StartsWith("Particles/") || n.StartsWith("Mobile/Particles") || n.StartsWith("Legacy Shaders/Particles")) return true;
+                  if (n.StartsWith("Custom/")) return true;
+                  if (n.StartsWith("Hidden/") && n != "Hidden/InternalErrorShader") return true;
+                  return false;
+              }
+
+              // Troca todos os shaders do jogo por um toon simples e barato (com contorno fino).
+              // Materiais "so contorno" ficam invisiveis; folhas viram toon com recorte, dos dois lados.
+              static void FixMaterials()
+              {
+                  try
+                  {
+                      if (toonShader == null) toonShader = Shader.Find("Custom/NoOutlineToon");
+                      if (invisibleShader == null) invisibleShader = Shader.Find("Custom/Invisible");
+                      if (toonShader == null) return;
+
+                      HashSet<Material> chars = new HashSet<Material>();
+                      SkinnedMeshRenderer[] sk = Resources.FindObjectsOfTypeAll<SkinnedMeshRenderer>();
+                      for (int i = 0; i < sk.Length; i++)
+                      {
+                          if (sk[i] == null) continue;
+                          Material[] sm = sk[i].sharedMaterials;
+                          for (int j = 0; j < sm.Length; j++) if (sm[j] != null) chars.Add(sm[j]);
+                      }
+
+                      Material[] ms = Resources.FindObjectsOfTypeAll<Material>();
+                      for (int i = 0; i < ms.Length; i++)
+                      {
+                          Material m = ms[i];
+                          if (m == null || m.shader == null) continue;
+                          if (m.shader == toonShader || m.shader == invisibleShader) continue;
+                          string n = m.shader.name;
+                          if (Keep(n)) continue;
+                          string mn = m.name.ToLowerInvariant();
+                          bool outline = n.IndexOf("outline", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                          bool leaf = mn.Contains("leaves") || mn.Contains("leaf");
+                          if (m.HasProperty("_Outline")) m.SetFloat("_Outline", 0f);
+                          if (outline && n.IndexOf("only", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                          {
+                              if (invisibleShader != null) m.shader = invisibleShader;
+                              continue;
+                          }
+                          Texture tex = m.HasProperty("_MainTex") ? m.GetTexture("_MainTex") : null;
+                          Color col = m.HasProperty("_Color") ? m.GetColor("_Color") : Color.white;
+                          Vector2 sc = m.HasProperty("_MainTex") ? m.GetTextureScale("_MainTex") : Vector2.one;
+                          Vector2 of = m.HasProperty("_MainTex") ? m.GetTextureOffset("_MainTex") : Vector2.zero;
+                          float cut = m.HasProperty("_Cutoff") ? m.GetFloat("_Cutoff") : 0f;
+                          if (leaf && cut < 0.5f) cut = 0.5f;
+                          int q = m.renderQueue;
+                          m.shader = toonShader;
+                          m.SetTexture("_MainTex", tex);
+                          m.SetTextureScale("_MainTex", sc);
+                          m.SetTextureOffset("_MainTex", of);
+                          m.SetColor("_Color", col);
+                          m.SetFloat("_Cutoff", cut);
+                          bool fade = q >= 3000;
+                          m.SetFloat("_SrcBlend", fade ? 5f : 1f);
+                          m.SetFloat("_DstBlend", fade ? 10f : 0f);
+                          m.SetFloat("_ZWrite", fade ? 0f : 1f);
+                          m.SetFloat("_Cull", leaf ? 0f : 2f);
+                          bool wantsOutline = !OutlineSoPersonagens || outline || chars.Contains(m);
+                          bool thin = !fade && !leaf && cut <= 0.01f && OutlineWidth > 0f && wantsOutline;
+                          m.SetFloat("_OutlineWidth", thin ? OutlineWidth : 0f);
+                          m.SetColor("_OutlineColor", Color.black);
+                          m.renderQueue = q;
+                      }
+                  }
+                  catch (System.Exception) { }
+              }
+          }
+          CSEOF
+
+      - name: Criar shaders toon (contorno fino)
+        run: |
+          mkdir -p project/Assets/Resources
+          cat > project/Assets/Resources/NoOutlineToon.shader <<'SHEOF1'
+          Shader "Custom/NoOutlineToon"
+          {
+              Properties
+              {
+                  _MainTex ("Texture", 2D) = "white" {}
+                  _Color ("Color", Color) = (1,1,1,1)
+                  _Cutoff ("Cutoff", Range(0,1)) = 0
+                  _SrcBlend ("Src", Float) = 1
+                  _DstBlend ("Dst", Float) = 0
+                  _ZWrite ("ZWrite", Float) = 1
+                  _Cull ("Cull", Float) = 2
+                  _OutlineWidth ("Outline Width", Float) = 0
+                  _OutlineColor ("Outline Color", Color) = (0,0,0,1)
+              }
+              SubShader
+              {
+                  Tags { "RenderType"="Opaque" }
+                  Pass
+                  {
+                      Tags { "LightMode"="ForwardBase" }
+                      Blend [_SrcBlend] [_DstBlend]
+                      ZWrite [_ZWrite]
+                      Cull [_Cull]
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #include "UnityCG.cginc"
+                      sampler2D _MainTex;
+                      float4 _MainTex_ST;
+                      fixed4 _Color;
+                      fixed _Cutoff;
+                      struct v2f
+                      {
+                          float4 pos : SV_POSITION;
+                          float2 uv : TEXCOORD0;
+                          fixed shade : TEXCOORD1;
+                      };
+                      v2f vert (appdata_base v)
+                      {
+                          v2f o;
+                          o.pos = UnityObjectToClipPos(v.vertex);
+                          o.uv = TRANSFORM_TEX(v.texcoord, _MainTex);
+                          float3 n = UnityObjectToWorldNormal(v.normal);
+                          float3 l = normalize(_WorldSpaceLightPos0.xyz + float3(0, 0.0001, 0));
+                          float nl = dot(n, l) * 0.5 + 0.5;
+                          o.shade = lerp(0.6, 1.0, smoothstep(0.3, 0.6, nl));
+                          return o;
+                      }
+                      fixed4 frag (v2f i) : SV_Target
+                      {
+                          fixed4 c = tex2D(_MainTex, i.uv) * _Color;
+                          clip(c.a - _Cutoff);
+                          c.rgb *= i.shade;
+                          return c;
+                      }
+                      ENDCG
+                  }
+                  Pass
+                  {
+                      Cull Front
+                      CGPROGRAM
+                      #pragma vertex vertO
+                      #pragma fragment fragO
+                      #include "UnityCG.cginc"
+                      float _OutlineWidth;
+                      fixed4 _OutlineColor;
+                      struct v2fo
+                      {
+                          float4 pos : SV_POSITION;
+                      };
+                      v2fo vertO (appdata_base v)
+                      {
+                          v2fo o;
+                          o.pos = UnityObjectToClipPos(v.vertex);
+                          if (_OutlineWidth <= 0.0)
+                          {
+                              o.pos = float4(2.0, 2.0, 2.0, 1.0);
+                              return o;
+                          }
+                          float3 norm = mul((float3x3)UNITY_MATRIX_IT_MV, v.normal);
+                          float2 dir = TransformViewToProjection(norm.xy);
+                          float dl = length(dir);
+                          dir = (dl > 0.00001) ? (dir / dl) : float2(0.0, 0.0);
+                          dir.x *= _ScreenParams.y / _ScreenParams.x;
+                          o.pos.xy += dir * o.pos.w * _OutlineWidth;
+                          return o;
+                      }
+                      fixed4 fragO (v2fo i) : SV_Target
+                      {
+                          return _OutlineColor;
+                      }
+                      ENDCG
+                  }
+              }
+          }
+          SHEOF1
+          cat > project/Assets/Resources/Invisible.shader <<'SHEOF2'
+          Shader "Custom/Invisible"
+          {
+              SubShader
+              {
+                  Tags { "Queue"="Geometry" "RenderType"="Opaque" }
+                  Pass
+                  {
+                      ZWrite Off
+                      ColorMask 0
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #include "UnityCG.cginc"
+                      struct v2f { float4 pos : SV_POSITION; };
+                      v2f vert (float4 v : POSITION)
+                      {
+                          v2f o;
+                          o.pos = UnityObjectToClipPos(v);
+                          return o;
+                      }
+                      fixed4 frag (v2f i) : SV_Target { return fixed4(0, 0, 0, 0); }
+                      ENDCG
+                  }
+              }
+          }
+          SHEOF2
+
+      - name: Colocar as scripts arrumadas (feitas a partir do projeto_unity.zip)
+        run: |
+          cd project/Assets
+          colocar() {
+            # $1 = nome do arquivo; o conteudo arrumado vem pela entrada
+            alvo=$(find . -type f -name "$1" ! -path "*/Editor/*" | head -n 1)
+            if [ -z "$alvo" ]; then echo "AVISO: $1 nao encontrada no projeto, nao foi substituida"; cat > /dev/null; return 0; fi
+            cat > "$alvo"
+            echo "script arrumada: $alvo"
+          }
+          colocar "PlayerCamera.cs" <<'CSFIX0EOF'
+          using OpenYandere.Managers;
+          using OpenYandere.Managers.Traits;
+          using UnityEngine;
+
+          namespace OpenYandere.Characters.Player
+          {
+              public class PlayerCamera : MonoBehaviour
+              {
+                  private PlayerMovement _playerMovement;
+
+                  private Vector3 _targetHeightOffset;
+
+                  private Vector3 _currentRotation;
+
+                  private Vector3 _currentRotationVelocity;
+
+                  private float _zoomDistance;
+
+                  [Header("Target Settings:")]
+                  private Transform _targetTransform;
+
+                  [SerializeField]
+                  private float _targetHeight = 1.65f;
+
+                  [SerializeField]
+                  private float _distanceFromTarget = 2f;
+
+                  [Header("Vertical (Up and Down) Settings:")]
+                  [SerializeField]
+                  private float _verticalMinLimit = -40f;
+
+                  [SerializeField]
+                  private float _verticalMaxLimit = 80f;
+
+                  [Header("Rotation Settings:")]
+                  [SerializeField]
+                  private float _rotationSmoothTime = 0.1f;
+
+                  [Header("Mouse Settings:")]
+                  [SerializeField]
+                  private float _mouseSensitivity = 5f;
+
+                  [SerializeField]
+                  private float _zoomSpeed = 150f;
+
+                  [SerializeField]
+                  private float _zoomMinimumDistance = 1f;
+
+                  [SerializeField]
+                  private float _zoomMaximumDistance = 10f;
+
+                  public float HorizontalAxis { get; set; }
+
+                  public float VerticalAxis { get; set; }
+
+                  private void Awake()
+                  {
+                      PlayerManager playerManager = Singleton<GameManager>.Instance.PlayerManager;
+                      _playerMovement = playerManager.PlayerMovement;
+                      _targetTransform = playerManager.Player.transform;
+                      _targetHeightOffset = new Vector3(0f, _targetHeight, 0f);
+                      HorizontalAxis = _targetTransform.eulerAngles.y;
+                      VerticalAxis = _targetTransform.eulerAngles.x;
+                      _zoomDistance = _distanceFromTarget;
+                  }
+
+                  private void LateUpdate()
+                  {
+                      if (Application.platform == RuntimePlatform.Android)
+                      {
+                          // Celular: so o dedo de olhar mexe a camera (o joystick nunca mexe).
+                          // Botao + aproxima e botao - afasta.
+                          HorizontalAxis += TouchControls.Look.x * _mouseSensitivity;
+                          VerticalAxis -= TouchControls.Look.y * _mouseSensitivity;
+                          float zoomBotoes = (TInput.GetKey(KeyCode.Equals) ? 1f : 0f) - (TInput.GetKey(KeyCode.Minus) ? 1f : 0f);
+                          _zoomDistance -= zoomBotoes * 3f * Time.deltaTime;
+                      }
+                      else
+                      {
+                          HorizontalAxis += Input.GetAxis("Mouse X") * _mouseSensitivity;
+                          VerticalAxis -= Input.GetAxis("Mouse Y") * _mouseSensitivity;
+                          _zoomDistance -= Input.GetAxis("Mouse ScrollWheel") * Time.deltaTime * _zoomSpeed;
+                      }
+                      _playerMovement.SetCameraAxis(HorizontalAxis);
+                      VerticalAxis = Mathf.Clamp(VerticalAxis, _verticalMinLimit, _verticalMaxLimit);
+                      _currentRotation = Vector3.SmoothDamp(_currentRotation, new Vector3(VerticalAxis, HorizontalAxis), ref _currentRotationVelocity, _rotationSmoothTime);
+                      base.transform.eulerAngles = _currentRotation;
+                      _zoomDistance = Mathf.Clamp(_zoomDistance, _zoomMinimumDistance, _zoomMaximumDistance);
+                      base.transform.position = _targetTransform.position - base.transform.forward * _zoomDistance + _targetHeightOffset;
+                  }
+
+                  public void SetTarget(Transform targetTransform, float targetHeight)
+                  {
+                      _targetTransform = targetTransform;
+                      _targetHeight = targetHeight;
+                      HorizontalAxis = _targetTransform.eulerAngles.y;
+                      VerticalAxis = _targetTransform.eulerAngles.x;
+                  }
+              }
+          }
+          CSFIX0EOF
+          colocar "KillSystem21.cs" <<'CSFIX1EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem21 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public Animation PlayerAnim;
+
+              public GameObject Phone;
+
+              public PlayerScriptByMiliko Move;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKeyDown(KeyCode.Tab))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  yield return new WaitForSeconds(0.1f);
+                  Player.GetComponent<KillSystem21>().enabled = false;
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = false;
+                  Player.GetComponent<KillSystem22>().enabled = true;
+                  Player.GetComponent<KillSystem14>().enabled = false;
+                  Phone.SetActive(value: true);
+                  Move.enabled = false;
+                  PlayerAnim.Play("f02_phoneIdle_00");
+              }
+          }
+          CSFIX1EOF
+          colocar "KillSystem3.cs" <<'CSFIX2EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem3 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public GameObject NPC1;
+
+              public GameObject NPC2;
+
+              public GameObject NPC3;
+
+              public GameObject NPC4;
+
+              public GameObject NPC5;
+
+              public GameObject NPC6;
+
+              public GameObject NPC7;
+
+              public GameObject Knife;
+
+              public GameObject PlayText;
+
+              public GameObject PlayTextOut;
+
+              public PlayerScriptByMiliko Move;
+
+              public GameObject KnifeHand;
+
+              public Animation PlayerAnim;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Knife.transform.position) < Distance && TInput.GetKeyDown(KeyCode.Alpha5))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<PlayerScriptByMiliko>();
+                  PlayerAnim.enabled = true;
+                  Knife.SetActive(value: false);
+                  KnifeHand.SetActive(value: true);
+                  yield return new WaitForSeconds(1f);
+                  PlayTextOut.SetActive(value: true);
+                  PlayText.SetActive(value: false);
+                  yield return new WaitForSeconds(3f);
+                  PlayTextOut.SetActive(value: false);
+                  PlayText.SetActive(value: false);
+                  Move.enabled = true;
+                  Move.enabled = true;
+                  NPC1.GetComponent<KillSystem>().enabled = true;
+                  NPC2.GetComponent<KillSystem>().enabled = true;
+                  NPC3.GetComponent<KillSystem>().enabled = true;
+                  NPC4.GetComponent<KillSystem>().enabled = true;
+                  NPC5.GetComponent<KillSystem>().enabled = true;
+                  NPC6.GetComponent<KillSystem>().enabled = true;
+                  NPC7.GetComponent<KillSystem>().enabled = true;
+              }
+          }
+          CSFIX2EOF
+          colocar "KillSystem18.cs" <<'CSFIX3EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+          using UnityEngine.AI;
+
+          public class KillSystem18 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public Animation GUIAnim;
+
+              public GameObject Pr;
+
+              public GameObject Talk;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public Animation NPCAnim;
+
+              public GameObject Path;
+
+              public GameObject PathHan;
+
+              public GameObject Hanako;
+
+              public GameObject Debug;
+
+              public GameObject Look;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKey(KeyCode.Alpha5))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<KillSystem21>().enabled = true;
+                  Pr.SetActive(value: true);
+                  Debug.SetActive(value: false);
+                  Talk.SetActive(value: false);
+                  NPCAnim.Play("f02_idleShort_00");
+                  Hanako.GetComponent<KillSystem19>().enabled = true;
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.GetComponent<KillSystem16>().enabled = false;
+                  Player.transform.LookAt(Look.transform);
+                  Hanako.transform.position = PathHan.transform.position;
+                  Hanako.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  Hanako.GetComponent<customwalkAI>().enabled = false;
+                  Hanako.GetComponent<NavMeshAgent>().enabled = false;
+                  Move.enabled = false;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem10>().enabled = false;
+                  Player.GetComponent<KillSystem11>().enabled = false;
+                  Player.GetComponent<KillSystem13>().enabled = false;
+                  Player.GetComponent<KillSystem18>().enabled = false;
+              }
+          }
+          CSFIX3EOF
+          colocar "KillSystem13.cs" <<'CSFIX4EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem13 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Path;
+
+              public GameObject Debug;
+
+              public GameObject Look;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKey(KeyCode.Alpha4))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<KillSystem21>().enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  Move.enabled = false;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem10>().enabled = false;
+                  Player.GetComponent<KillSystem11>().enabled = false;
+                  Player.GetComponent<KillSystem13>().enabled = false;
+                  Player.GetComponent<KillSystem16>().enabled = false;
+              }
+          }
+          CSFIX4EOF
+          colocar "KillSystem11.cs" <<'CSFIX5EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem11 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Path;
+
+              public GameObject Debug;
+
+              public GameObject Look;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKey(KeyCode.Alpha3))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<KillSystem21>().enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  Move.enabled = false;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem10>().enabled = false;
+                  Player.GetComponent<KillSystem11>().enabled = false;
+                  Player.GetComponent<KillSystem16>().enabled = false;
+                  Player.GetComponent<KillSystem13>().enabled = false;
+              }
+          }
+          CSFIX5EOF
+          colocar "KillSystem10.cs" <<'CSFIX6EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem10 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Path;
+
+              public GameObject Debug;
+
+              public GameObject Look;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKey(KeyCode.Alpha1))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<KillSystem21>().enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  Move.enabled = false;
+                  Player.transform.LookAt(Look.transform);
+                  Player.transform.position = Path.transform.position;
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem10>().enabled = false;
+                  Player.GetComponent<KillSystem11>().enabled = false;
+                  Player.GetComponent<KillSystem16>().enabled = false;
+                  Player.GetComponent<KillSystem13>().enabled = false;
+              }
+          }
+          CSFIX6EOF
+          colocar "KillSystem16.cs" <<'CSFIX7EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem16 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Debug;
+
+              public GameObject HairMain;
+
+              public GameObject Hair;
+
+              public GameObject Cape;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKey(KeyCode.Alpha2))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Player.GetComponent<KillSystem21>().enabled = true;
+                  Move.enabled = true;
+                  yield return new WaitForSeconds(0.3f);
+                  Move.IdleAnim = "f02_sithIdle_00";
+                  Move.WalkAnim = "f02_sithWalk_00";
+                  Move.SprintAnim = "f02_sithRun_00";
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  HairMain.SetActive(value: false);
+                  Hair.SetActive(value: true);
+                  Cape.SetActive(value: true);
+              }
+          }
+          CSFIX7EOF
+          colocar "KillSystem23.cs" <<'CSFIX8EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem23 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public GameObject Blood;
+
+              public GameObject ENPC;
+
+              public GameObject GUI;
+
+              public Animation NPCAnim;
+
+              public Animation PlayerAnim;
+
+              public GameObject NPC;
+
+              public Animation BloodAnim;
+
+              public PlayerScriptByMiliko Move;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, NPC.transform.position) < Distance && TInput.GetKeyDown(KeyCode.Alpha2))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Blood.transform.parent = null;
+                  BloodAnim.Play("BloodOut");
+                  GUI.SetActive(value: true);
+                  NPCAnim.enabled = true;
+                  ENPC.GetComponent<KillSystem23>().enabled = false;
+                  ENPC.GetComponent<KillSystem24>().enabled = true;
+                  Move.IdleAnim = "f02_carryIdleA_00";
+                  Move.WalkAnim = "f02_carryWalkA_00";
+                  Move.SprintAnim = "f02_carryRunA_00";
+                  NPC.transform.parent = Player.transform;
+                  NPCAnim.Play("f02_carryIdleB_00");
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+              }
+          }
+          CSFIX8EOF
+          colocar "KillSystem24.cs" <<'CSFIX9EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem24 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public GameObject BP;
+
+              public GameObject Spine;
+
+              public GameObject GUI;
+
+              public GameObject ENPC;
+
+              public Animation NPCAnim;
+
+              public Animation BloodAnim;
+
+              public Animation PlayerAnim;
+
+              public GameObject NPC;
+
+              public PlayerScriptByMiliko Move;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, NPC.transform.position) < Distance && TInput.GetKeyDown(KeyCode.C))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  BP.transform.parent = Spine.transform;
+                  BP.transform.position = Spine.transform.position;
+                  BloodAnim.Play("BloodPoolz");
+                  GUI.SetActive(value: true);
+                  NPCAnim.enabled = false;
+                  ENPC.GetComponent<KillSystem23>().enabled = true;
+                  ENPC.GetComponent<KillSystem24>().enabled = false;
+                  Move.IdleAnim = "f02_idleShort_00";
+                  Move.WalkAnim = "f02_newWalk_00";
+                  Move.SprintAnim = "f02_newSprint_00";
+                  NPC.transform.parent = null;
+                  yield return new WaitForSeconds(0.1f);
+                  Move.enabled = true;
+              }
+          }
+          CSFIX9EOF
+          colocar "KillSystem26.cs" <<'CSFIX10EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem26 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public AudioSource whatever;
+
+              public AudioSource TYSM;
+
+              public GameObject NPCC;
+
+              public Animation GUIAnim;
+
+              public GameObject Look;
+
+              public GameObject GUI;
+
+              public GameObject BR;
+
+              public Animation NPCAnim;
+
+              public Animation PlayerAnim;
+
+              public GameObject NPC;
+
+              public PlayerScriptByMiliko Move;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, NPC.transform.position) < Distance && TInput.GetKeyDown(KeyCode.C))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  whatever.Play();
+                  TYSM.Stop();
+                  GUI.SetActive(value: true);
+                  GUIAnim.Play("Close");
+                  yield return new WaitForSeconds(0.01f);
+                  NPCC.GetComponent<HeadLookAt>().enabled = true;
+                  NPC.GetComponent<KillSystem27>().enabled = false;
+                  NPC.GetComponent<KillSystem25>().enabled = true;
+                  NPC.GetComponent<KillSystem26>().enabled = false;
+                  Move.enabled = true;
+                  NPCC.GetComponent<KillSystem>().enabled = true;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  BR.SetActive(value: true);
+                  yield return new WaitForSeconds(3f);
+                  BR.SetActive(value: false);
+              }
+          }
+          CSFIX10EOF
+          colocar "KillSystem14.cs" <<'CSFIX11EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem14 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Debug;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKeyDown(KeyCode.Return))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Move.enabled = false;
+                  yield return new WaitForSeconds(0.1f);
+                  Debug.SetActive(value: true);
+                  Player.GetComponent<KillSystem10>().enabled = true;
+                  Player.GetComponent<KillSystem16>().enabled = true;
+                  Player.GetComponent<KillSystem11>().enabled = true;
+                  Player.GetComponent<KillSystem13>().enabled = true;
+                  Player.GetComponent<KillSystem15>().enabled = true;
+                  Player.GetComponent<KillSystem18>().enabled = true;
+                  Player.GetComponent<KillSystem14>().enabled = false;
+                  Player.GetComponent<KillSystem21>().enabled = false;
+              }
+          }
+          CSFIX11EOF
+          colocar "KillSystem15.cs" <<'CSFIX12EOF'
+          using System.Collections;
+          using ControlFreak2;
+          using UnityEngine;
+
+          public class KillSystem15 : MonoBehaviour
+          {
+              public GameObject Player;
+
+              public PlayerScriptByMiliko Move;
+
+              public Animation PlayerAnim;
+
+              public GameObject Debug;
+
+              [Range(0.4f, 10f)]
+              public float Distance;
+
+              private void Start()
+              {
+                  PlayerAnim.GetComponent<Animation>();
+              }
+
+              private void Update()
+              {
+                  if (Vector3.Distance(Player.transform.position, Player.transform.position) < Distance && TInput.GetKeyDown(KeyCode.Return))
+                  {
+                      StartCoroutine(Kill());
+                  }
+              }
+
+              private IEnumerator Kill()
+              {
+                  Move.enabled = true;
+                  yield return new WaitForSeconds(0.1f);
+                  Debug.SetActive(value: false);
+                  Player.GetComponent<KillSystem10>().enabled = false;
+                  Player.GetComponent<KillSystem11>().enabled = false;
+                  Player.GetComponent<KillSystem16>().enabled = false;
+                  Player.GetComponent<KillSystem13>().enabled = false;
+                  Player.GetComponent<KillSystem18>().enabled = false;
+                  Player.GetComponent<KillSystem15>().enabled = false;
+                  Player.GetComponent<KillSystem14>().enabled = true;
+                  Player.GetComponent<KillSystem21>().enabled = true;
+              }
+          }
+          CSFIX12EOF
+
+      - name: Reparar scripts decompilados (nomes gerados pelo compilador)
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          from pathlib import Path
+          mudados = 0
+          for p in Path("project/Assets").rglob("*.cs"):
+              try:
+                  t = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              # <Nome>k__BackingField, <Start>d__5  ->  _Nome_k__BackingField, _Start_d__5
+              n = re.sub(r"<([A-Za-z_]\w*)>(\w*__\w*)", r"_\1_\2", t)
+              # <>c__DisplayClass1_0, <>1__state  ->  _c__DisplayClass1_0, _1__state
+              n = re.sub(r"<>([A-Za-z0-9_]\w*)", r"_\1", n)
+              if n != t:
+                  p.write_text(n, encoding="utf-8")
+                  mudados += 1
+          print("Scripts reparadas (nomes gerados pelo compilador):", mudados)
+          PYEOF
+
+      - name: Corrigir shaders do TextMeshPro (o AssetRipper exporta vazios e o texto vira retangulo)
+        run: |
+          trocar() {
+            # $1 = nome do arquivo .shader exportado; o shader certo vem pela entrada
+            alvo=$(find project/Assets -type f -name "$1" | head -n 1)
+            if [ -z "$alvo" ]; then echo "AVISO: $1 nao encontrado, nada trocado"; cat > /dev/null; return 0; fi
+            cat > "$alvo"
+            echo "shader arrumado: $alvo"
+          }
+          trocar "TextMeshPro_Mobile_Distance Field.shader" <<'TMPSDFEOF'
+          Shader "TextMeshPro/Mobile/Distance Field" {
+              Properties {
+                  [HDR] _FaceColor ("Face Color", Color) = (1,1,1,1)
+                  _FaceDilate ("Face Dilate", Range(-1,1)) = 0
+                  [HDR] _OutlineColor ("Outline Color", Color) = (0,0,0,1)
+                  _OutlineWidth ("Outline Thickness", Range(0,1)) = 0
+                  _OutlineSoftness ("Outline Softness", Range(0,1)) = 0
+                  [HDR] _UnderlayColor ("Border Color", Color) = (0,0,0,.5)
+                  _UnderlayOffsetX ("Border OffsetX", Range(-1,1)) = 0
+                  _UnderlayOffsetY ("Border OffsetY", Range(-1,1)) = 0
+                  _UnderlayDilate ("Border Dilate", Range(-1,1)) = 0
+                  _UnderlaySoftness ("Border Softness", Range(0,1)) = 0
+                  _WeightNormal ("Weight Normal", Float) = 0
+                  _WeightBold ("Weight Bold", Float) = .5
+                  _ShaderFlags ("Flags", Float) = 0
+                  _ScaleRatioA ("Scale RatioA", Float) = 1
+                  _ScaleRatioB ("Scale RatioB", Float) = 1
+                  _ScaleRatioC ("Scale RatioC", Float) = 1
+                  _MainTex ("Font Atlas", 2D) = "white" {}
+                  _TextureWidth ("Texture Width", Float) = 512
+                  _TextureHeight ("Texture Height", Float) = 512
+                  _GradientScale ("Gradient Scale", Float) = 5
+                  _ScaleX ("Scale X", Float) = 1
+                  _ScaleY ("Scale Y", Float) = 1
+                  _PerspectiveFilter ("Perspective Correction", Range(0, 1)) = 0.875
+                  _Sharpness ("Sharpness", Range(-1,1)) = 0
+                  _VertexOffsetX ("Vertex OffsetX", Float) = 0
+                  _VertexOffsetY ("Vertex OffsetY", Float) = 0
+                  _ClipRect ("Clip Rect", Vector) = (-32767, -32767, 32767, 32767)
+                  _MaskSoftnessX ("Mask SoftnessX", Float) = 0
+                  _MaskSoftnessY ("Mask SoftnessY", Float) = 0
+                  _StencilComp ("Stencil Comparison", Float) = 8
+                  _Stencil ("Stencil ID", Float) = 0
+                  _StencilOp ("Stencil Operation", Float) = 0
+                  _StencilWriteMask ("Stencil Write Mask", Float) = 255
+                  _StencilReadMask ("Stencil Read Mask", Float) = 255
+                  _CullMode ("Cull Mode", Float) = 0
+                  _ColorMask ("Color Mask", Float) = 15
+              }
+
+              SubShader {
+                  Tags { "Queue"="Transparent" "IgnoreProjector"="True" "RenderType"="Transparent" }
+
+                  Stencil {
+                      Ref [_Stencil]
+                      Comp [_StencilComp]
+                      Pass [_StencilOp]
+                      ReadMask [_StencilReadMask]
+                      WriteMask [_StencilWriteMask]
+                  }
+
+                  Cull [_CullMode]
+                  ZWrite Off
+                  Lighting Off
+                  Fog { Mode Off }
+                  ZTest [unity_GUIZTestMode]
+                  Blend One OneMinusSrcAlpha
+                  ColorMask [_ColorMask]
+
+                  Pass {
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #pragma target 3.0
+                      #pragma multi_compile __ UNITY_UI_CLIP_RECT
+
+                      #include "UnityCG.cginc"
+                      #include "UnityUI.cginc"
+
+                      struct appdata_t {
+                          float4 vertex : POSITION;
+                          fixed4 color : COLOR;
+                          float2 texcoord : TEXCOORD0;
+                      };
+
+                      struct v2f {
+                          float4 vertex : SV_POSITION;
+                          fixed4 color : COLOR;
+                          float2 texcoord : TEXCOORD0;
+                          float4 localPos : TEXCOORD1;
+                      };
+
+                      sampler2D _MainTex;
+                      fixed4 _FaceColor;
+                      fixed4 _OutlineColor;
+                      float _FaceDilate;
+                      float _OutlineWidth;
+                      float _VertexOffsetX;
+                      float _VertexOffsetY;
+                      float4 _ClipRect;
+
+                      v2f vert (appdata_t v)
+                      {
+                          v2f o;
+                          float4 p = v.vertex;
+                          p.x += _VertexOffsetX;
+                          p.y += _VertexOffsetY;
+                          o.localPos = p;
+                          o.vertex = UnityObjectToClipPos(p);
+                          o.color = v.color;
+                          o.texcoord = v.texcoord;
+                          return o;
+                      }
+
+                      fixed4 frag (v2f i) : SV_Target
+                      {
+                          // O atlas do texto guarda a distancia ate a borda da letra no canal alfa (0.5 = borda)
+                          half d = tex2D(_MainTex, i.texcoord).a;
+                          half aa = max(fwidth(d) * 0.75h, 0.02h);
+                          half edge = 0.5h - _FaceDilate * 0.25h;
+                          half face = smoothstep(edge - aa, edge + aa, d);
+
+                          fixed4 faceCol = i.color * _FaceColor;
+                          faceCol.rgb *= faceCol.a;
+                          fixed4 col = faceCol * face;
+
+                          if (_OutlineWidth > 0.001)
+                          {
+                              half outerEdge = max(edge - _OutlineWidth * 0.5h, 0.02h);
+                              half outer = smoothstep(outerEdge - aa, outerEdge + aa, d);
+                              fixed4 oc = _OutlineColor;
+                              oc.a *= i.color.a;
+                              oc.rgb *= oc.a;
+                              col = lerp(oc, faceCol, face) * outer;
+                          }
+
+                          #ifdef UNITY_UI_CLIP_RECT
+                          col *= UnityGet2DClipping(i.localPos.xy, _ClipRect);
+                          #endif
+
+                          return col;
+                      }
+                      ENDCG
+                  }
+              }
+              Fallback "UI/Default"
+          }
+          TMPSDFEOF
+          trocar "TextMeshPro_Sprite.shader" <<'TMPSPREOF'
+          Shader "TextMeshPro/Sprite" {
+              Properties {
+                  [PerRendererData] _MainTex ("Sprite Texture", 2D) = "white" {}
+                  _Color ("Tint", Color) = (1,1,1,1)
+                  _StencilComp ("Stencil Comparison", Float) = 8
+                  _Stencil ("Stencil ID", Float) = 0
+                  _StencilOp ("Stencil Operation", Float) = 0
+                  _StencilWriteMask ("Stencil Write Mask", Float) = 255
+                  _StencilReadMask ("Stencil Read Mask", Float) = 255
+                  _CullMode ("Cull Mode", Float) = 0
+                  _ColorMask ("Color Mask", Float) = 15
+                  _ClipRect ("Clip Rect", Vector) = (-32767, -32767, 32767, 32767)
+                  [Toggle(UNITY_UI_ALPHACLIP)] _UseUIAlphaClip ("Use Alpha Clip", Float) = 0
+              }
+
+              SubShader {
+                  Tags { "Queue"="Transparent" "IgnoreProjector"="True" "RenderType"="Transparent" "PreviewType"="Plane" "CanUseSpriteAtlas"="True" }
+
+                  Stencil {
+                      Ref [_Stencil]
+                      Comp [_StencilComp]
+                      Pass [_StencilOp]
+                      ReadMask [_StencilReadMask]
+                      WriteMask [_StencilWriteMask]
+                  }
+
+                  Cull [_CullMode]
+                  ZWrite Off
+                  Lighting Off
+                  Fog { Mode Off }
+                  ZTest [unity_GUIZTestMode]
+                  Blend SrcAlpha OneMinusSrcAlpha
+                  ColorMask [_ColorMask]
+
+                  Pass {
+                      CGPROGRAM
+                      #pragma vertex vert
+                      #pragma fragment frag
+                      #pragma multi_compile __ UNITY_UI_CLIP_RECT
+                      #pragma multi_compile __ UNITY_UI_ALPHACLIP
+
+                      #include "UnityCG.cginc"
+                      #include "UnityUI.cginc"
+
+                      struct appdata_t {
+                          float4 vertex : POSITION;
+                          fixed4 color : COLOR;
+                          float2 texcoord : TEXCOORD0;
+                      };
+
+                      struct v2f {
+                          float4 vertex : SV_POSITION;
+                          fixed4 color : COLOR;
+                          float2 texcoord : TEXCOORD0;
+                          float4 localPos : TEXCOORD1;
+                      };
+
+                      sampler2D _MainTex;
+                      fixed4 _Color;
+                      float4 _ClipRect;
+
+                      v2f vert (appdata_t v)
+                      {
+                          v2f o;
+                          o.localPos = v.vertex;
+                          o.vertex = UnityObjectToClipPos(v.vertex);
+                          o.color = v.color * _Color;
+                          o.texcoord = v.texcoord;
+                          return o;
+                      }
+
+                      fixed4 frag (v2f i) : SV_Target
+                      {
+                          fixed4 col = tex2D(_MainTex, i.texcoord) * i.color;
+
+                          #ifdef UNITY_UI_CLIP_RECT
+                          col.a *= UnityGet2DClipping(i.localPos.xy, _ClipRect);
+                          #endif
+
+                          #ifdef UNITY_UI_ALPHACLIP
+                          clip(col.a - 0.001);
+                          #endif
+
+                          return col;
+                      }
+                      ENDCG
+                  }
+              }
+              Fallback "UI/Default"
+          }
+          TMPSPREOF
+
+      - name: Trocar leituras de teclado pelas que aceitam toque
+        run: |
+          cd project/Assets
+          [ -d Scripts ] && cd Scripts
+          grep -rlZE --exclude-dir=Editor --include=*.cs '(CF2Input|Input)\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(' . | xargs -0 -r perl -pi -e 's/(?<![\.\w])(?:UnityEngine\.)?(?:CF2Input|Input)\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(/TInput.$1(/g'
+          echo "Chamadas trocadas: $(grep -rho --include=*.cs 'TInput\.Get' . | wc -l)"
+          echo "Chamadas originais restantes (Input/CF2Input, fora de Editor): $(grep -rhoE --exclude-dir=Editor --include=*.cs '(^|[^.A-Za-z_])(UnityEngine\.)?(CF2Input|Input)\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(' . | wc -l)"
+          grep -rnE --exclude-dir=Editor --include=*.cs '(^|[^.A-Za-z_])(UnityEngine\.)?(CF2Input|Input)\.(GetKeyDown|GetKeyUp|GetKey|GetAxisRaw|GetAxis)\(' . | head -20 || true
+          echo "Scripts que usam mouse direto (posicao/clique): $(grep -rlE --include=*.cs 'Input\.(mousePosition|GetMouseButton)' . | wc -l)"
+
+      - name: Camera principal olha so pelo toque (ignora o joystick)
+        run: |
+          cd project/Assets
+          [ -d Scripts ] && cd Scripts
+          find . -iname '*camera*.cs' ! -path '*/Editor/*' -print0 | while IFS= read -r -d '' f; do
+            perl -pi -e 's/TInput\.GetAxisRaw\(/TInput.CamAxis(/g; s/TInput\.GetAxis\(/TInput.CamAxis(/g' "$f"
+            echo "camera ajustada: $f"
+          done
+          echo "--- arquivos que leem eixos Horizontal/Vertical/Mouse:"
+          grep -rlE --include=*.cs 'TInput\.(GetAxis|GetAxisRaw|CamAxis)\("(Horizontal|Vertical|Mouse X|Mouse Y)"' . | head -30 || true
+
+      - name: Corrigir pasta de configuracao no Android
+        run: |
+          cd project/Assets
+          [ -d Scripts ] && cd Scripts
+          grep -rlZE --exclude-dir=Editor --include=*.cs 'Environment\.GetFolderPath' . | xargs -0 -r perl -pi -e 's/Environment\.GetFolderPath\(Environment\.SpecialFolder\.(MyDocuments|Personal|ApplicationData|LocalApplicationData|DesktopDirectory)\)/Application.persistentDataPath/g'
+          echo "persistentDataPath em: $(grep -rl --include=*.cs 'Application.persistentDataPath' . | wc -l) arquivos"
+
+      - name: Ler a versao da Unity do projeto exportado
+        id: unityver
+        run: |
+          V=$(grep -m1 '^m_EditorVersion:' project/ProjectSettings/ProjectVersion.txt | sed 's/^m_EditorVersion:[[:space:]]*//' | tr -d '\r ')
+          test -n "$V" || { echo "Versao da Unity nao encontrada no ProjectVersion.txt"; exit 1; }
+          echo "Unity do projeto: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Instalar a Unity do projeto (com modulo Android)
+        uses: RageAgainstThePixel/unity-setup@v1
+        with:
+          version-file: None
+          unity-version: ${{ steps.unityver.outputs.version }}
+          build-targets: Android
+
+      - name: Ativar licenca Personal
+        uses: RageAgainstThePixel/activate-unity-license@v1
+        with:
+          license: personal
+          username: "opsariel123@gmail.com"
+          password: "Y_6anderes"
+
+      - name: Compilar o APK
+        uses: RageAgainstThePixel/unity-action@v1
+        with:
+          log-name: build-apk
+          args: -quit -batchmode -nographics -projectPath ${{ github.workspace }}/project -buildTarget Android -executeMethod CIBuild.Build
+
+      - name: Enviar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Agniezka-APK
+          path: build/*.apk
+          if-no-files-found: error
+
+      - name: Diagnostico do Unity Hub
+        if: always()
+        run: |
+          dpkg -l | grep -i unityhub || echo "pacote unityhub NAO instalado"
+          dpkg -L unityhub 2>/dev/null | head -40 || true
+          ls -la /opt || true
+          ls -la /opt/unityhub 2>/dev/null | head -30 || echo "sem /opt/unityhub"
+          apt-cache policy unityhub | head -10 || true
+
+      - name: Resumo dos erros do Unity
+        if: failure()
+        run: |
+          LOGS="$HOME/.config/unity3d/Editor.log $(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE" "$HOME" -name '*.log' -size +200k 2>/dev/null | head -5)"
+          for f in $LOGS; do
+            [ -f "$f" ] || continue
+            echo "=============== $f ($(wc -l < "$f") linhas)"
+            echo "--- erros de compilacao (error CS):"
+            grep -E "error CS[0-9]+" "$f" | sed 's/^.*Assets\//Assets\//' | awk '!seen[$0]++' | head -40
+            echo "--- total de linhas com error CS: $(grep -cE 'error CS[0-9]+' "$f")"
+            echo "--- outras falhas:"
+            grep -nE "Scripts have compiler errors|Build Failed|BuildFailedException|Aborting batchmode|Android SDK|NDK|Gradle|FAILURE|Exception:" "$f" | awk '!seen[$0]++' | head -30
+          done
